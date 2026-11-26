@@ -23,6 +23,30 @@ namespace abb_hardware_interface
 static constexpr size_t NUM_CONNECTION_TRIES = 100;
 static const rclcpp::Logger LOGGER = rclcpp::get_logger("ABBSystemHardware");
 
+// The joint names from the robot controller description carry a mechanical
+// unit prefix (e.g. "ROB_1_joint_1"); the interfaces are exported under the
+// name from "joint" on. A robot description may prefix its joint names as
+// well (e.g. "irb4600_joint_1", several robots in one ROS graph): export the
+// interfaces under the ros2_control joint whose name ends in that same
+// "joint..." suffix, else under the stripped name (upstream behaviour).
+static std::string urdfJointName(const std::string& rws_name,
+                                 const std::vector<hardware_interface::ComponentInfo>& joints)
+{
+  const auto pos = rws_name.find("joint");
+  const std::string stripped = pos == std::string::npos ? rws_name : rws_name.substr(pos);
+  for (const auto& joint : joints)
+  {
+    const std::string& name = joint.name;
+    if (name.size() > stripped.size() &&
+        name.compare(name.size() - stripped.size(), stripped.size(), stripped) == 0 &&
+        name[name.size() - stripped.size() - 1] == '_')
+    {
+      return name;
+    }
+  }
+  return stripped;
+}
+
 CallbackReturn ABBSystemHardware::on_init(const hardware_interface::HardwareInfo& info)
 {
   if (hardware_interface::SystemInterface::on_init(info) != CallbackReturn::SUCCESS)
@@ -218,8 +242,7 @@ std::vector<hardware_interface::StateInterface> ABBSystemHardware::export_state_
       {
         // TODO(seng): Consider changing joint names in robot description to match what comes
         // from the ABB robot description to avoid needing to strip the prefix here
-        const auto pos = joint.name.find("joint");
-        const auto joint_name = joint.name.substr(pos);
+        const auto joint_name = urdfJointName(joint.name, info_.joints);
         state_interfaces.emplace_back(
             hardware_interface::StateInterface(joint_name, hardware_interface::HW_IF_POSITION, &joint.state.position));
         state_interfaces.emplace_back(
@@ -241,8 +264,7 @@ std::vector<hardware_interface::CommandInterface> ABBSystemHardware::export_comm
       {
         // TODO(seng): Consider changing joint names in robot description to match what comes
         // from the ABB robot description to avoid needing to strip the prefix here
-        const auto pos = joint.name.find("joint");
-        const auto joint_name = joint.name.substr(pos);
+        const auto joint_name = urdfJointName(joint.name, info_.joints);
         command_interfaces.emplace_back(hardware_interface::CommandInterface(
             joint_name, hardware_interface::HW_IF_POSITION, &joint.command.position));
         command_interfaces.emplace_back(hardware_interface::CommandInterface(
