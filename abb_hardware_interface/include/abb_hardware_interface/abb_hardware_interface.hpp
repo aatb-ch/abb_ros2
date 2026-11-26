@@ -71,6 +71,33 @@ private:
 
   // Store the state and commands for the robot(s)
   abb::robot::MotionData motion_data_;
+
+  // EGM session supervision (see read()/write()): when EGM stops streaming
+  // or stops running, the hardware deactivates itself so ros2_control
+  // deactivates the controllers commanding it.
+  bool egmSessionOk(std::string& why) const;
+  std::chrono::steady_clock::time_point egm_not_ok_since_{};
+  bool egm_not_ok_{ false };
+  bool egm_lost_{ false };
+  std::string egm_lost_reason_;
+  std::chrono::milliseconds egm_loss_grace_{ 50 };
+
+  // Soft joint limits on the commands, from the URDF <limit>:
+  // one entry per joint, in motion_data_ iteration order.
+  struct CommandLimit
+  {
+    std::string name;
+    double min_position;
+    double max_position;
+    bool has_velocity;
+    double max_velocity;
+    double last_position;   // last position sent (seeded at activation)
+  };
+  bool initCommandLimits();
+  void enforceCommandLimits(double period_s);
+  std::vector<CommandLimit> command_limits_;
+  double soft_limit_margin_{ 0.00872665 };   // rad (0.5 deg) inside the URDF limits
+  std::chrono::steady_clock::time_point last_limit_log_{};
 };
 
 }  // namespace abb_hardware_interface

@@ -16,6 +16,9 @@
 #include <abb_hardware_interface/abb_hardware_interface.hpp>
 #include <abb_hardware_interface/utilities.hpp>
 
+#include <algorithm>
+#include <cmath>
+
 using namespace std::chrono_literals;
 
 namespace abb_hardware_interface
@@ -23,11 +26,43 @@ namespace abb_hardware_interface
 static constexpr size_t NUM_CONNECTION_TRIES = 100;
 static const rclcpp::Logger LOGGER = rclcpp::get_logger("ABBSystemHardware");
 
+// The joint names from the robot controller description carry a mechanical
+// unit prefix (e.g. "ROB_1_joint_1"); the interfaces are exported under the
+// name from "joint" on. A robot description may prefix its joint names as
+// well (e.g. "irb4600_joint_1", several robots in one ROS graph): export the
+// interfaces under the ros2_control joint whose name ends in that same
+// "joint..." suffix, else under the stripped name (upstream behaviour).
+static std::string urdfJointName(const std::string& rws_name,
+                                 const std::vector<hardware_interface::ComponentInfo>& joints)
+{
+  const auto pos = rws_name.find("joint");
+  const std::string stripped = pos == std::string::npos ? rws_name : rws_name.substr(pos);
+  for (const auto& joint : joints)
+  {
+    const std::string& name = joint.name;
+    if (name.size() > stripped.size() &&
+        name.compare(name.size() - stripped.size(), stripped.size(), stripped) == 0 &&
+        name[name.size() - stripped.size() - 1] == '_')
+    {
+      return name;
+    }
+  }
+  return stripped;
+}
+
 CallbackReturn ABBSystemHardware::on_init(const hardware_interface::HardwareInfo& info)
 {
   if (hardware_interface::SystemInterface::on_init(info) != CallbackReturn::SUCCESS)
   {
     return CallbackReturn::ERROR;
+  }
+
+  // How long the EGM session may be not streaming / not running before the
+  // hardware deactivates itself. Default 50 ms (~12 EGM cycles).
+  const auto grace_it = info_.hardware_parameters.find("egm_loss_grace_ms");
+  if (grace_it != info_.hardware_parameters.end())
+  {
+    egm_loss_grace_ = std::chrono::milliseconds(std::stoi(grace_it->second));
   }
 
   // Validate interfaces configured in ros2_control xacro.
@@ -204,7 +239,126 @@ CallbackReturn ABBSystemHardware::on_init(const hardware_interface::HardwareInfo
     return CallbackReturn::ERROR;
   }
 
+  if (!initCommandLimits())
+  {
+    return CallbackReturn::ERROR;
+  }
+
   return CallbackReturn::SUCCESS;
+}
+
+bool ABBSystemHardware::initCommandLimits()
+{
+  // Soft joint limits, as the ROS 1
+  // abb_robot_driver enforced them: every command is checked against the
+  // URDF <limit> of its joint, `soft_limit_margin` (hardware parameter, rad,
+  // default 0.00872665 = 0.5 deg) inside it. The margin matters: a command AT
+  // the hard limit trips abb_egm_rws_managers' own bounds check (it throws,
+  // the hardware errors out) after the deg conversion, and the controller's
+  // range supervision faults when the arm reaches the limit still moving.
+  // Fail closed: a joint without position limits refuses to load.
+  const auto margin_it = info_.hardware_parameters.find("soft_limit_margin");
+  if (margin_it != info_.hardware_parameters.end())
+  {
+    soft_limit_margin_ = std::stod(margin_it->second);
+  }
+  command_limits_.clear();
+  for (const auto& group : motion_data_.groups)
+  {
+    for (const auto& unit : group.units)
+    {
+      for (const auto& joint : unit.joints)
+      {
+        const auto name = urdfJointName(joint.name, info_.joints);
+        const auto it = info_.limits.find(name);
+        if (it == info_.limits.end() || !it->second.has_position_limits)
+        {
+          RCLCPP_FATAL(LOGGER, "Joint '%s' has no URDF position limits - refusing to command it",
+                       name.c_str());
+          return false;
+        }
+        const auto& lim = it->second;
+        const double lo = lim.min_position + soft_limit_margin_;
+        const double hi = lim.max_position - soft_limit_margin_;
+        if (!(lo < hi))
+        {
+          RCLCPP_FATAL(LOGGER, "Joint '%s': soft_limit_margin leaves no range", name.c_str());
+          return false;
+        }
+        command_limits_.push_back(CommandLimit{ name, lo, hi, lim.has_velocity_limits, lim.max_velocity, 0.0 });
+        RCLCPP_INFO(LOGGER, "Soft limits %s: [%.4f, %.4f] rad, %.4f rad/s%s", name.c_str(), lo, hi,
+                    lim.max_velocity, lim.has_velocity_limits ? "" : " (none)");
+        if (!lim.has_velocity_limits)
+        {
+          RCLCPP_WARN(LOGGER, "Joint '%s' has no URDF velocity limit - position limits only", name.c_str());
+        }
+      }
+    }
+  }
+  return true;
+}
+
+void ABBSystemHardware::enforceCommandLimits(double period_s)
+{
+  // Position: clamp into [min, max]. Velocity: the position may move at most
+  // max_velocity x period from the last position sent, and the velocity
+  // command is clamped to +-max_velocity. A clamp means something upstream
+  // (a trajectory validation layer, the JTC) let a bad command through: it is logged.
+  size_t k = 0;
+  bool clamped = false;
+  std::string what;
+  for (auto& group : motion_data_.groups)
+  {
+    for (auto& unit : group.units)
+    {
+      for (auto& joint : unit.joints)
+      {
+        if (k >= command_limits_.size())
+        {
+          return;
+        }
+        auto& lim = command_limits_[k++];
+        const double wanted = joint.command.position;
+        double pos = std::isfinite(wanted) ? wanted : lim.last_position;
+        pos = std::clamp(pos, lim.min_position, lim.max_position);
+        if (lim.has_velocity && period_s > 0.0)
+        {
+          const double step = lim.max_velocity * period_s;
+          pos = std::clamp(pos, lim.last_position - step, lim.last_position + step);
+        }
+        double vel = std::isfinite(joint.command.velocity) ? joint.command.velocity : 0.0;
+        if (lim.has_velocity)
+        {
+          vel = std::clamp(vel, -lim.max_velocity, lim.max_velocity);
+        }
+        if (pos <= lim.min_position || pos >= lim.max_position)
+        {
+          // at a position limit: never push further out
+          if ((pos <= lim.min_position && vel < 0.0) || (pos >= lim.max_position && vel > 0.0))
+          {
+            vel = 0.0;
+          }
+        }
+        if (!(std::abs(pos - wanted) <= 1e-9) || !(std::abs(vel - joint.command.velocity) <= 1e-9))
+        {
+          clamped = true;
+          what = lim.name;
+        }
+        joint.command.position = pos;
+        joint.command.velocity = vel;
+        lim.last_position = pos;
+      }
+    }
+  }
+  if (clamped)
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_limit_log_ >= std::chrono::seconds(1))
+    {
+      last_limit_log_ = now;
+      RCLCPP_ERROR(LOGGER, "soft limits: command for %s clamped to its URDF limits", what.c_str());
+    }
+  }
 }
 
 std::vector<hardware_interface::StateInterface> ABBSystemHardware::export_state_interfaces()
@@ -218,8 +372,7 @@ std::vector<hardware_interface::StateInterface> ABBSystemHardware::export_state_
       {
         // TODO(seng): Consider changing joint names in robot description to match what comes
         // from the ABB robot description to avoid needing to strip the prefix here
-        const auto pos = joint.name.find("joint");
-        const auto joint_name = joint.name.substr(pos);
+        const auto joint_name = urdfJointName(joint.name, info_.joints);
         state_interfaces.emplace_back(
             hardware_interface::StateInterface(joint_name, hardware_interface::HW_IF_POSITION, &joint.state.position));
         state_interfaces.emplace_back(
@@ -241,8 +394,7 @@ std::vector<hardware_interface::CommandInterface> ABBSystemHardware::export_comm
       {
         // TODO(seng): Consider changing joint names in robot description to match what comes
         // from the ABB robot description to avoid needing to strip the prefix here
-        const auto pos = joint.name.find("joint");
-        const auto joint_name = joint.name.substr(pos);
+        const auto joint_name = urdfJointName(joint.name, info_.joints);
         command_interfaces.emplace_back(hardware_interface::CommandInterface(
             joint_name, hardware_interface::HW_IF_POSITION, &joint.command.position));
         command_interfaces.emplace_back(hardware_interface::CommandInterface(
@@ -276,7 +428,27 @@ CallbackReturn ABBSystemHardware::on_activate(const rclcpp_lifecycle::State& /* 
     rclcpp::sleep_for(500ms);
   }
 
-  egm_manager_->read(motion_data_);
+  // EGMManager::Channel::read() only takes over the joint states once the
+  // channel counts as active, i.e. once a message with a sequence number
+  // different from the previous one was read. The first message of an EGM
+  // session has seqno 0, equal to the default-constructed "previous" header,
+  // so a single read() here leaves every joint state at 0.0 - and the command
+  // below would then send the robot to all-zero joint angles. Keep reading
+  // until real states arrived.
+  bool have_states = false;
+  for (size_t i = 0; i < NUM_CONNECTION_TRIES && rclcpp::ok() && !have_states; ++i)
+  {
+    have_states = egm_manager_->read(motion_data_);
+    if (!have_states)
+    {
+      egm_manager_->waitForMessage(500);
+    }
+  }
+  if (!have_states)
+  {
+    RCLCPP_ERROR(LOGGER, "No joint states received over EGM");
+    return CallbackReturn::ERROR;
+  }
   for (auto& group : motion_data_.groups)
   {
     for (auto& unit : group.units)
@@ -289,19 +461,99 @@ CallbackReturn ABBSystemHardware::on_activate(const rclcpp_lifecycle::State& /* 
     }
   }
 
+  // Soft limits: the velocity bound starts from the actual position.
+  {
+    size_t k = 0;
+    for (const auto& group : motion_data_.groups)
+      for (const auto& unit : group.units)
+        for (const auto& joint : unit.joints)
+          if (k < command_limits_.size())
+            command_limits_[k++].last_position = joint.state.position;
+  }
+
+  // A fresh session: supervision starts over (an activation only happens
+  // once EGM streams again - see the wait above).
+  egm_not_ok_ = false;
+  egm_lost_ = false;
+  egm_lost_reason_.clear();
+
   RCLCPP_INFO(LOGGER, "ros2_control hardware interface was successfully started!");
 
   return CallbackReturn::SUCCESS;
 }
 
-return_type ABBSystemHardware::read(const rclcpp::Time& time, const rclcpp::Duration& period)
+bool ABBSystemHardware::egmSessionOk(std::string& why) const
+{
+  for (const auto& group : motion_data_.groups)
+  {
+    const auto& channel = group.egm_channel_data;
+    if (!channel.is_active)
+    {
+      why = "EGM channel '" + channel.name + "' stopped streaming";
+      return false;
+    }
+    if (channel.input.status().egm_state() != abb::egm::wrapper::Status::EGM_RUNNING)
+    {
+      why = "EGM on channel '" + channel.name + "' is not running (" +
+            abb::egm::wrapper::Status::EGMState_Name(channel.input.status().egm_state()) + ")";
+      return false;
+    }
+    if (channel.input.status().rapid_execution_state() != abb::egm::wrapper::Status::RAPID_RUNNING)
+    {
+      why = "RAPID is not running (channel '" + channel.name + "')";
+      return false;
+    }
+  }
+  return true;
+}
+
+return_type ABBSystemHardware::read(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/)
 {
   egm_manager_->read(motion_data_);
+
+  // EGM session supervision. Upstream keeps the
+  // hardware and its controllers active when EGM goes away: the channel
+  // just stops updating (the joint states freeze with fresh stamps), the
+  // JTC keeps interpolating into nothing and reports success, and when EGM
+  // comes back the robot jumps to wherever the JTC's command is by then.
+  // Here a session that is not streaming/running for longer than the grace
+  // period latches egm_lost_, and write() returns DEACTIVATE: the
+  // controller_manager deactivates this hardware and every controller
+  // claiming its command interfaces. Activating it again (on_activate)
+  // re-seeds command = state, and a re-activated JTC holds the actual
+  // position - never a jump. The ROS 1 abb_robot_driver did the same with
+  // a controller reset + egm_controller_stopper.
+  std::string why;
+  if (egmSessionOk(why))
+  {
+    egm_not_ok_ = false;
+  }
+  else
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (!egm_not_ok_)
+    {
+      egm_not_ok_ = true;
+      egm_not_ok_since_ = now;
+    }
+    if (!egm_lost_ && now - egm_not_ok_since_ >= egm_loss_grace_)
+    {
+      egm_lost_ = true;
+      egm_lost_reason_ = why;
+    }
+  }
   return return_type::OK;
 }
 
-return_type ABBSystemHardware::write(const rclcpp::Time& time, const rclcpp::Duration& period)
+return_type ABBSystemHardware::write(const rclcpp::Time& /*time*/, const rclcpp::Duration& period)
 {
+  if (egm_lost_)
+  {
+    RCLCPP_ERROR(LOGGER, "%s - deactivating the hardware and its controllers (activate it again once EGM runs)",
+                 egm_lost_reason_.c_str());
+    return return_type::DEACTIVATE;
+  }
+  enforceCommandLimits(period.seconds());
   egm_manager_->write(motion_data_);
   return return_type::OK;
 }
