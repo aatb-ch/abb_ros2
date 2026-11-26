@@ -63,6 +63,10 @@ public:
   CallbackReturn on_deactivate(const rclcpp_lifecycle::State& previous_state) override;
 
   ROS2_CONTROL_DRIVER_PUBLIC
+  return_type prepare_command_mode_switch(const std::vector<std::string>& start_interfaces,
+                                          const std::vector<std::string>& stop_interfaces) override;
+
+  ROS2_CONTROL_DRIVER_PUBLIC
   return_type perform_command_mode_switch(const std::vector<std::string>& start_interfaces,
                                           const std::vector<std::string>& stop_interfaces) override;
 
@@ -83,9 +87,21 @@ private:
   // EGM session supervision (see read()/write()): when EGM stops streaming
   // or stops running, the hardware deactivates itself so ros2_control
   // deactivates the controllers commanding it.
-  bool egmSessionOk(std::string& why) const;
-  std::chrono::steady_clock::time_point egm_not_ok_since_{};
-  bool egm_not_ok_{ false };
+  // Robot-reported states (EGM running, RAPID running, motors on) are
+  // checked on every new message and fail at once; only silence (no new
+  // sequence number) gets egm_loss_grace_.
+  bool robotReportsRunning(std::string& why) const;
+  void superviseSession(std::chrono::steady_clock::time_point now);
+  struct ChannelSupervision
+  {
+    bool seen{ false };
+    uint32_t seqno{ 0 };
+    std::chrono::steady_clock::time_point last_new{};
+    bool silent{ false };
+  };
+  std::vector<ChannelSupervision> channels_;
+  bool restarted_{ false };   // a sequence number restart was seen in this read()
+  std::chrono::steady_clock::time_point last_utilization_log_{};
   bool egm_lost_{ false };
   std::string egm_lost_reason_;
   std::chrono::milliseconds egm_loss_grace_{ 50 };
@@ -128,7 +144,6 @@ private:
   bool active_{ false };
   bool have_states_{ false };
   bool session_running_{ false };
-  uint32_t last_seqno_{ 0 };
 
   // What the robot actually got: the robot sends its next message only after
   // our reply to the previous one, so when a new sequence number arrives,

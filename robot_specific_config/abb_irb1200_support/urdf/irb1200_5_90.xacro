@@ -5,6 +5,7 @@
   <xacro:arg name="rws_ip" default="None"/>
   <xacro:property name="rws_ip" value="$(arg rws_ip)"/>
   <xacro:arg name="rws_port" default="80"/>
+  <xacro:arg name="egm_loss_grace_ms" default="50"/>
   <xacro:property name="rws_port" value="$(arg rws_port)"/>
   <xacro:arg name="configure_via_rws" default="true"/>
   <xacro:property name="configure_via_rws" value="$(arg configure_via_rws)"/>
@@ -20,5 +21,6 @@
     use_fake_hardware="${use_fake_hardware}"
     rws_ip="${rws_ip}"
     rws_port="${rws_port}"
+    egm_loss_grace_ms="$(arg egm_loss_grace_ms)"
     configure_via_rws="${configure_via_rws}"/>
 </robot>

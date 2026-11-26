@@ -54,7 +54,7 @@ TEST_F(HwTest, EgmSilenceDeactivatesAfterGrace)
   run(500);
   const auto dt = std::chrono::steady_clock::now() - t0;
   EXPECT_FALSE(active_);
-  EXPECT_GE(dt, 50ms);
+  EXPECT_GE(dt, 45ms);  // counted from the last message, up to one period earlier
   EXPECT_LT(dt, 200ms);
 }
 

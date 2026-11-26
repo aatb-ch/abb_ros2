@@ -86,6 +86,14 @@ def generate_launch_description():
     )
     declared_arguments.append(
         DeclareLaunchArgument(
+            "egm_loss_grace_ms",
+            default_value="50",
+            description="EGM silence [ms] tolerated before the hardware deactivates itself \
+            (and its controllers). Robot-reported stops deactivate at once.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
             "configure_via_rws",
             default_value="true",
             description="If false, the robot description will be generate from joint information \
@@ -125,6 +133,7 @@ def generate_launch_description():
     rws_ip = LaunchConfiguration("rws_ip")
     rws_port = LaunchConfiguration("rws_port")
     configure_via_rws = LaunchConfiguration("configure_via_rws")
+    egm_loss_grace_ms = LaunchConfiguration("egm_loss_grace_ms")
     initial_joint_controller = LaunchConfiguration("initial_joint_controller")
     launch_rviz = LaunchConfiguration("launch_rviz")
 
@@ -153,6 +162,9 @@ def generate_launch_description():
             " ",
             "configure_via_rws:=",
             configure_via_rws,
+            " ",
+            "egm_loss_grace_ms:=",
+            egm_loss_grace_ms,
             " ",
         ]
     )
