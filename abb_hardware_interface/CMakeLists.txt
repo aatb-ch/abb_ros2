@@ -84,7 +84,8 @@ if(BUILD_TESTING)
   foreach(test_name
       test_abb_hardware_interface
       test_idle_hold
-      test_session_supervision)
+      test_session_supervision
+      test_packet_step)
     ament_add_gtest(${test_name} test/${test_name}.cpp TIMEOUT 300)
     target_include_directories(${test_name} PRIVATE include test)
     target_link_libraries(${test_name}

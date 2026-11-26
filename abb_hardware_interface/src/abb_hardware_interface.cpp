@@ -66,6 +66,17 @@ CallbackReturn ABBSystemHardware::on_init(const hardware_interface::HardwareInfo
     egm_loss_grace_ = std::chrono::milliseconds(std::stoi(grace_it->second));
   }
 
+  // Per-sent-packet step limit (off unless > 0), see enforcePacketStep().
+  const auto step_it = info_.hardware_parameters.find("egm_max_step_scale");
+  if (step_it != info_.hardware_parameters.end())
+  {
+    max_step_scale_ = std::stod(step_it->second);
+  }
+  if (max_step_scale_ > 0.0)
+  {
+    RCLCPP_INFO(LOGGER, "Per-packet step limit: %.2f x max_velocity per EGM sample", max_step_scale_);
+  }
+
   // Validate interfaces configured in ros2_control xacro.
   for (const hardware_interface::ComponentInfo& joint : info_.joints)
   {
@@ -634,7 +645,7 @@ void ABBSystemHardware::latchHold(const char* why)
     }
   }
   hold_valid_ = true;
-  last_sent_ = hold_position_;  // the robot's own reference
+  last_sent_ = hold_position_;  // the robot's own reference: no step from here
   pending_ = hold_position_;
   if (why)
   {
@@ -706,8 +717,61 @@ void ABBSystemHardware::answerEgmWithHold(double period_s)
     command_limits_[k].last_position = hold_position_[k];
   }
   enforceCommandLimits(period_s);
+  enforcePacketStep();
   notePending();
   egm_manager_->write(motion_data_);
+}
+
+void ABBSystemHardware::enforcePacketStep()
+{
+  // Limit the step per EGM reply relative to the reply actually SENT before
+  // (not to the last position written: during an inbound gap the controller
+  // keeps writing, nothing is sent, and the first reply after the gap would
+  // carry the whole catch-up - up to 11.7 deg in one 4 ms packet was seen on
+  // a virtual controller). With this limit, a gap shorter than the loss grace
+  // is caught up at no more than scale x max_velocity; a longer gap ends the
+  // session (see superviseSession()). The soft limits' per-cycle step bound
+  // stays as it is.
+  if (max_step_scale_ <= 0.0 || last_sent_.size() != command_limits_.size())
+  {
+    return;
+  }
+  size_t k = 0;
+  bool clamped = false;
+  std::string what;
+  for (auto& group : motion_data_.groups)
+  {
+    for (auto& unit : group.units)
+    {
+      for (auto& joint : unit.joints)
+      {
+        const auto& lim = command_limits_[k];
+        if (lim.has_velocity)
+        {
+          const double step = max_step_scale_ * lim.max_velocity * sample_time_s_;
+          const double pos = std::clamp(joint.command.position, last_sent_[k] - step, last_sent_[k] + step);
+          if (pos != joint.command.position)
+          {
+            clamped = true;
+            what = lim.name;
+            joint.command.position = pos;
+          }
+        }
+        pending_[k] = joint.command.position;
+        ++k;
+      }
+    }
+  }
+  if (clamped)
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_step_log_ >= std::chrono::seconds(1))
+    {
+      last_step_log_ = now;
+      RCLCPP_ERROR(LOGGER, "per-packet step limit: command for %s clamped (link gap or too fast a command)",
+                   what.c_str());
+    }
+  }
 }
 
 void ABBSystemHardware::trackSession()
@@ -805,6 +869,7 @@ void ABBSystemHardware::superviseSession(std::chrono::steady_clock::time_point n
   //    ignored.
   static constexpr uint32_t SESSION_START_SEQNO = 50;  // first 200 ms of a session
   restarted_ = false;
+  new_message_ = false;
   if (channels_.size() != motion_data_.groups.size())
   {
     channels_.assign(motion_data_.groups.size(), ChannelSupervision{});
@@ -818,17 +883,34 @@ void ABBSystemHardware::superviseSession(std::chrono::steady_clock::time_point n
     {
       continue;
     }
+    const uint32_t stamp_ms = channel.input.header().time_stamp();
     if (!sup.seen || seqno > sup.seqno)
     {
+      if (sup.seen && seqno == sup.seqno + 1 && stamp_ms > sup.stamp_ms && stamp_ms - sup.stamp_ms <= 100)
+      {
+        // The robot's own sample time: the smallest time-stamp step between
+        // consecutive messages (a pause on the robot side shows up larger).
+        // (EGM samples at 4 ms or slower.)
+        const double dt = std::max(0.004, (stamp_ms - sup.stamp_ms) / 1000.0);
+        if (!sample_time_known_ || dt < sample_time_s_)
+        {
+          sample_time_s_ = dt;
+          sample_time_known_ = true;
+        }
+      }
       sup.seen = true;
       sup.seqno = seqno;
+      sup.stamp_ms = stamp_ms;
       sup.last_new = now;
+      new_message_ = true;
     }
     else if (seqno < sup.seqno && seqno < SESSION_START_SEQNO)
     {
       sup.seqno = seqno;
+      sup.stamp_ms = stamp_ms;
       sup.last_new = now;
       restarted_ = true;
+      new_message_ = true;
     }
     const bool silent = now - sup.last_new > egm_loss_grace_;
     if (silent != sup.silent)
@@ -898,14 +980,11 @@ return_type ABBSystemHardware::read(const rclcpp::Time& /*time*/, const rclcpp::
     have_states_ = true;
   }
   superviseSession(std::chrono::steady_clock::now());
-  if (!motion_data_.groups.empty())
+  if (new_message_ && pending_.size() == last_sent_.size())
   {
-    const uint32_t seqno = motion_data_.groups.front().egm_channel_data.input.header().sequence_number();
-    if (seqno != last_seen_seqno_ && pending_.size() == last_sent_.size())
-    {
-      last_sent_ = pending_;
-    }
-    last_seen_seqno_ = seqno;
+    // The robot only sends its next message after it got our reply to the
+    // previous one: whatever was written last went out with that reply.
+    last_sent_ = pending_;
   }
   trackSession();
 
@@ -937,6 +1016,7 @@ return_type ABBSystemHardware::write(const rclcpp::Time& /*time*/, const rclcpp:
   }
   applyHold();
   enforceCommandLimits(period.seconds());
+  enforcePacketStep();
   notePending();
   egm_manager_->write(motion_data_);
   return return_type::OK;

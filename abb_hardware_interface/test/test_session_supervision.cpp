@@ -91,7 +91,7 @@ TEST_F(Supervision, SilenceGetsTheGrace)
   robot_->setSending(false);
   const auto dt = timeToDeactivate(this, [&] { return run(1000); });
   EXPECT_FALSE(active_);
-  EXPECT_GE(dt, 200ms);
+  EXPECT_GE(dt, 195ms);  // counted from the last message, up to one period earlier
   EXPECT_LT(dt, 300ms);
 }
 
