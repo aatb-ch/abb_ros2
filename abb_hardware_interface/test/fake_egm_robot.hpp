@@ -103,6 +103,16 @@ public:
   {
     sending_ = sending;
   }
+  // Every datagram is sent twice (a duplicating link).
+  void setDuplicate(bool dup)
+  {
+    duplicate_ = dup;
+  }
+  // Next cycle, also send one old datagram (seqno - back): a reordering link.
+  void sendStaleOnce(uint32_t back)
+  {
+    stale_back_ = back;
+  }
   // The next message starts a new EGM session (seqno 0).
   void newSession()
   {
@@ -187,13 +197,30 @@ private:
       if (sending_)
       {
         std::string out;
+        std::string stale;
         {
           std::lock_guard<std::mutex> l(m_);
           buildMessage(std::chrono::steady_clock::now() - t0).SerializeToString(&out);
+          const uint32_t back = stale_back_.exchange(0);
+          if (back > 0 && back <= seqno_)
+          {
+            const uint32_t keep = seqno_;
+            seqno_ -= back;
+            buildMessage(std::chrono::steady_clock::now() - t0).SerializeToString(&stale);
+            seqno_ = keep;
+          }
           last_seqno_ = seqno_++;
           ++sent_;
         }
         ::sendto(sock_, out.data(), out.size(), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+        if (duplicate_)
+        {
+          ::sendto(sock_, out.data(), out.size(), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+        }
+        if (!stale.empty())
+        {
+          ::sendto(sock_, stale.data(), stale.size(), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+        }
       }
       next += period;
       // Collect replies until the next send is due.
@@ -318,6 +345,8 @@ private:
   std::thread thread_;
   std::atomic<bool> run_{ false };
   std::atomic<bool> sending_{ true };
+  std::atomic<bool> duplicate_{ false };
+  std::atomic<uint32_t> stale_back_{ 0 };
   mutable std::mutex m_;
   std::condition_variable cv_;
   Joints position_;

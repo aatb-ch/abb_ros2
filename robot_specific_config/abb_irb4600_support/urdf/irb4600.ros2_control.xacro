@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <xacro:macro name="abb_ros2_control" params="name prefix use_fake_hardware:=true rws_ip rws_port">
+  <xacro:macro name="abb_ros2_control" params="name prefix use_fake_hardware:=true rws_ip rws_port egm_loss_grace_ms:=50">
     <ros2_control name="${name}" type="system">
       <hardware>
         <!-- ros2_control simulation -->
@@ -17,6 +17,9 @@
           <param name="rws_ip">${rws_ip}</param>
           <!-- The following parameter is used for non-MultiMove only -->
           <param name="egm_port">6511</param>
+          <!-- EGM silence [ms] tolerated before the hardware deactivates
+               (robot-reported stops deactivate at once). -->
+          <param name="egm_loss_grace_ms">${egm_loss_grace_ms}</param>
           <!-- The following parameters are used for the MultiMove example only -->
           <!-- <param name="rob1egm_port">6511</param> -->
           <!-- <param name="extaxegm_port">6512</param> -->

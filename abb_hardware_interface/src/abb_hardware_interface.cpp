@@ -479,9 +479,19 @@ CallbackReturn ABBSystemHardware::on_activate(const rclcpp_lifecycle::State& /* 
     command_limits_[k].last_position = hold_position_[k];
   }
 
-  // A fresh session: supervision starts over (an activation only happens
-  // once EGM streams again - see the wait above).
-  egm_not_ok_ = false;
+  // Only a running session can be commanded (the ROS 1 driver refused to
+  // start controllers otherwise, egm_hardware_interface.cpp:281-337).
+  std::string why;
+  if (!robotReportsRunning(why))
+  {
+    RCLCPP_ERROR(LOGGER, "Not activating: %s", why.c_str());
+    return CallbackReturn::FAILURE;
+  }
+
+  // A fresh session: supervision starts over.
+  const auto now = std::chrono::steady_clock::now();
+  channels_.assign(motion_data_.groups.size(), ChannelSupervision{});
+  superviseSession(now);
   egm_lost_ = false;
   egm_lost_reason_.clear();
 
@@ -502,6 +512,41 @@ CallbackReturn ABBSystemHardware::on_deactivate(const rclcpp_lifecycle::State& /
   std::fill(claimed_velocity_.begin(), claimed_velocity_.end(), false);
   holdLastCommand();
   return CallbackReturn::SUCCESS;
+}
+
+return_type ABBSystemHardware::prepare_command_mode_switch(const std::vector<std::string>& start_interfaces,
+                                                          const std::vector<std::string>& /*stop_interfaces*/)
+{
+  // Refuse to let a controller claim a command interface unless the EGM
+  // session is running (ROS 1: prepareSwitch(), egm_hardware_interface.cpp
+  // :281-337). Releasing is always allowed.
+  bool claims = false;
+  for (const auto& full_name : start_interfaces)
+  {
+    for (const auto& joint : joint_names_)
+    {
+      claims = claims || full_name.rfind(joint + "/", 0) == 0;
+    }
+  }
+  if (!claims)
+  {
+    return return_type::OK;
+  }
+  std::string why;
+  if (!active_)
+  {
+    why = "the hardware is not active";
+  }
+  else if (egm_lost_)
+  {
+    why = egm_lost_reason_;
+  }
+  else if (robotReportsRunning(why))
+  {
+    return return_type::OK;
+  }
+  RCLCPP_ERROR(LOGGER, "Refusing to start a controller: %s", why.c_str());
+  return return_type::ERROR;
 }
 
 return_type ABBSystemHardware::perform_command_mode_switch(const std::vector<std::string>& start_interfaces,
@@ -672,21 +717,11 @@ void ABBSystemHardware::trackSession()
   // session that starts while nothing claims the interfaces gets a freshly
   // latched target: the arm may have been moved (RAPID, a jog) in between,
   // and an old target would drive it back.
-  bool running = !motion_data_.groups.empty();
-  bool restarted = false;
-  for (const auto& group : motion_data_.groups)
-  {
-    const auto& channel = group.egm_channel_data;
-    const auto& status = channel.input.status();
-    // Robot-reported states only: channel activity (a read-count heuristic
-    // in the managers) flaps with link jitter and is not a new session.
-    running = running && status.egm_state() == abb::egm::wrapper::Status::EGM_RUNNING &&
-              status.rapid_execution_state() == abb::egm::wrapper::Status::RAPID_RUNNING &&
-              status.motor_state() == abb::egm::wrapper::Status::MOTORS_ON;
-    const uint32_t seqno = channel.input.header().sequence_number();
-    restarted = restarted || seqno < last_seqno_;
-    last_seqno_ = seqno;
-  }
+  // Robot-reported states only: channel activity (a read-count heuristic
+  // in the managers) flaps with link jitter and is not a new session.
+  std::string why;
+  const bool running = !motion_data_.groups.empty() && robotReportsRunning(why);
+  const bool restarted = restarted_;
   if (!anyPositionClaimed() && have_states_)
   {
     if (!running)
@@ -731,29 +766,129 @@ void ABBSystemHardware::drainEgm()
   }
 }
 
-bool ABBSystemHardware::egmSessionOk(std::string& why) const
+bool ABBSystemHardware::robotReportsRunning(std::string& why) const
 {
   for (const auto& group : motion_data_.groups)
   {
     const auto& channel = group.egm_channel_data;
-    if (!channel.is_active)
-    {
-      why = "EGM channel '" + channel.name + "' stopped streaming";
-      return false;
-    }
-    if (channel.input.status().egm_state() != abb::egm::wrapper::Status::EGM_RUNNING)
+    const auto& status = channel.input.status();
+    if (status.egm_state() != abb::egm::wrapper::Status::EGM_RUNNING)
     {
       why = "EGM on channel '" + channel.name + "' is not running (" +
-            abb::egm::wrapper::Status::EGMState_Name(channel.input.status().egm_state()) + ")";
+            abb::egm::wrapper::Status::EGMState_Name(status.egm_state()) + ")";
       return false;
     }
-    if (channel.input.status().rapid_execution_state() != abb::egm::wrapper::Status::RAPID_RUNNING)
+    if (status.rapid_execution_state() != abb::egm::wrapper::Status::RAPID_RUNNING)
     {
       why = "RAPID is not running (channel '" + channel.name + "')";
       return false;
     }
+    if (status.motor_state() != abb::egm::wrapper::Status::MOTORS_ON)
+    {
+      why = "the motors are off (channel '" + channel.name + "')";
+      return false;
+    }
   }
   return true;
+}
+
+void ABBSystemHardware::superviseSession(std::chrono::steady_clock::time_point now)
+{
+  // Sequence numbers, per channel. The managers only count reads with an
+  // unchanged number (5 reads = 10 ms at 500 Hz, not ~250 ms as in the
+  // synchronous ROS 1 loop), so supervision here is by time:
+  //  * a higher number is a new message;
+  //  * the same number is a duplicate read (the controller manager runs
+  //    faster than EGM) or a duplicated datagram: not fresh;
+  //  * a lower number below SESSION_START_SEQNO is a new session (EGM
+  //    restarted); any other lower number is a stale, reordered datagram:
+  //    ignored.
+  static constexpr uint32_t SESSION_START_SEQNO = 50;  // first 200 ms of a session
+  restarted_ = false;
+  if (channels_.size() != motion_data_.groups.size())
+  {
+    channels_.assign(motion_data_.groups.size(), ChannelSupervision{});
+  }
+  for (size_t g = 0; g < motion_data_.groups.size(); ++g)
+  {
+    const auto& channel = motion_data_.groups[g].egm_channel_data;
+    auto& sup = channels_[g];
+    const uint32_t seqno = channel.input.header().sequence_number();
+    if (!have_states_)
+    {
+      continue;
+    }
+    if (!sup.seen || seqno > sup.seqno)
+    {
+      sup.seen = true;
+      sup.seqno = seqno;
+      sup.last_new = now;
+    }
+    else if (seqno < sup.seqno && seqno < SESSION_START_SEQNO)
+    {
+      sup.seqno = seqno;
+      sup.last_new = now;
+      restarted_ = true;
+    }
+    const bool silent = now - sup.last_new > egm_loss_grace_;
+    if (silent != sup.silent)
+    {
+      sup.silent = silent;
+      if (silent)
+      {
+        RCLCPP_WARN(LOGGER, "No EGM message on channel '%s' for more than %ld ms (did the EGM session end?)",
+                    channel.name.c_str(), static_cast<long>(egm_loss_grace_.count()));
+      }
+      else
+      {
+        RCLCPP_INFO(LOGGER, "EGM messages on channel '%s' resumed", channel.name.c_str());
+      }
+    }
+    // As the ROS 1 driver (egm_hardware_interface.cpp:221-229).
+    if (channel.input.status().utilization_rate() > 100.0 && now - last_utilization_log_ > std::chrono::seconds(10))
+    {
+      last_utilization_log_ = now;
+      RCLCPP_WARN(LOGGER,
+                  "EGM utilization rate on channel '%s' is %.0f %% (the commanded motion is too aggressive and "
+                  "should be reduced)",
+                  channel.name.c_str(), channel.input.status().utilization_rate());
+    }
+  }
+
+  // While active: a robot-reported stop or a new session ends the session at
+  // once (the ROS 1 driver reset its controllers on every such change,
+  // egm_hardware_interface.cpp:239-246); silence beyond the grace too.
+  if (!active_ || egm_lost_ || !have_states_)
+  {
+    return;
+  }
+  std::string why;
+  if (!robotReportsRunning(why))
+  {
+    egm_lost_ = true;
+  }
+  else if (restarted_)
+  {
+    egm_lost_ = true;
+    why = "a new EGM session started";
+  }
+  else
+  {
+    for (size_t g = 0; g < channels_.size(); ++g)
+    {
+      if (channels_[g].silent)
+      {
+        egm_lost_ = true;
+        why = "no EGM message on channel '" + motion_data_.groups[g].egm_channel_data.name + "' for more than " +
+              std::to_string(egm_loss_grace_.count()) + " ms";
+        break;
+      }
+    }
+  }
+  if (egm_lost_)
+  {
+    egm_lost_reason_ = why;
+  }
 }
 
 return_type ABBSystemHardware::read(const rclcpp::Time& /*time*/, const rclcpp::Duration& period)
@@ -762,6 +897,7 @@ return_type ABBSystemHardware::read(const rclcpp::Time& /*time*/, const rclcpp::
   {
     have_states_ = true;
   }
+  superviseSession(std::chrono::steady_clock::now());
   if (!motion_data_.groups.empty())
   {
     const uint32_t seqno = motion_data_.groups.front().egm_channel_data.input.header().sequence_number();
@@ -783,37 +919,11 @@ return_type ABBSystemHardware::read(const rclcpp::Time& /*time*/, const rclcpp::
     answerEgmWithHold(period.seconds());
   }
 
-  // EGM session supervision. Upstream keeps the
-  // hardware and its controllers active when EGM goes away: the channel
-  // just stops updating (the joint states freeze with fresh stamps), the
-  // JTC keeps interpolating into nothing and reports success, and when EGM
-  // comes back the robot jumps to wherever the JTC's command is by then.
-  // Here a session that is not streaming/running for longer than the grace
-  // period latches egm_lost_, and write() returns DEACTIVATE: the
-  // controller_manager deactivates this hardware and every controller
-  // claiming its command interfaces. Activating it again (on_activate)
-  // re-seeds command = state, and a re-activated JTC holds the actual
-  // position - never a jump. The ROS 1 abb_robot_driver did the same with
-  // a controller reset + egm_controller_stopper.
-  std::string why;
-  if (egmSessionOk(why))
-  {
-    egm_not_ok_ = false;
-  }
-  else
-  {
-    const auto now = std::chrono::steady_clock::now();
-    if (!egm_not_ok_)
-    {
-      egm_not_ok_ = true;
-      egm_not_ok_since_ = now;
-    }
-    if (!egm_lost_ && now - egm_not_ok_since_ >= egm_loss_grace_)
-    {
-      egm_lost_ = true;
-      egm_lost_reason_ = why;
-    }
-  }
+  // EGM session supervision: write() returns DEACTIVATE once the session
+  // is lost, and ros2_control deactivates this hardware and every
+  // controller claiming its command interfaces in that cycle (the ROS 1
+  // driver's controller reset + egm_controller_stopper). Activating it
+  // again starts from the robot's reference (see on_activate()).
   return return_type::OK;
 }
 

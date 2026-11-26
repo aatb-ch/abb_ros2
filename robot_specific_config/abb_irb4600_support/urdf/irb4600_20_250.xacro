@@ -5,6 +5,7 @@
   <xacro:arg name="rws_ip" default="None"/>
   <xacro:property name="rws_ip" value="$(arg rws_ip)"/>
   <xacro:arg name="rws_port" default="80"/>
+  <xacro:arg name="egm_loss_grace_ms" default="50"/>
   <xacro:property name="rws_port" value="$(arg rws_port)"/>
   <!-- Robot description -->
   <xacro:include filename="$(find abb_irb4600_support)/urdf/irb4600_20_250_macro.xacro"/>
@@ -17,5 +18,6 @@
     prefix=""
     use_fake_hardware="${use_fake_hardware}"
     rws_ip="${rws_ip}"
-    rws_port="${rws_port}"/>
+    rws_port="${rws_port}"
+    egm_loss_grace_ms="$(arg egm_loss_grace_ms)"/>
 </robot>
