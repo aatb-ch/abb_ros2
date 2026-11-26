@@ -16,6 +16,9 @@
 #include <abb_hardware_interface/abb_hardware_interface.hpp>
 #include <abb_hardware_interface/utilities.hpp>
 
+#include <algorithm>
+#include <cmath>
+
 using namespace std::chrono_literals;
 
 namespace abb_hardware_interface
@@ -236,7 +239,126 @@ CallbackReturn ABBSystemHardware::on_init(const hardware_interface::HardwareInfo
     return CallbackReturn::ERROR;
   }
 
+  if (!initCommandLimits())
+  {
+    return CallbackReturn::ERROR;
+  }
+
   return CallbackReturn::SUCCESS;
+}
+
+bool ABBSystemHardware::initCommandLimits()
+{
+  // Soft joint limits, as the ROS 1
+  // abb_robot_driver enforced them: every command is checked against the
+  // URDF <limit> of its joint, `soft_limit_margin` (hardware parameter, rad,
+  // default 0.00872665 = 0.5 deg) inside it. The margin matters: a command AT
+  // the hard limit trips abb_egm_rws_managers' own bounds check (it throws,
+  // the hardware errors out) after the deg conversion, and the controller's
+  // range supervision faults when the arm reaches the limit still moving.
+  // Fail closed: a joint without position limits refuses to load.
+  const auto margin_it = info_.hardware_parameters.find("soft_limit_margin");
+  if (margin_it != info_.hardware_parameters.end())
+  {
+    soft_limit_margin_ = std::stod(margin_it->second);
+  }
+  command_limits_.clear();
+  for (const auto& group : motion_data_.groups)
+  {
+    for (const auto& unit : group.units)
+    {
+      for (const auto& joint : unit.joints)
+      {
+        const auto name = urdfJointName(joint.name, info_.joints);
+        const auto it = info_.limits.find(name);
+        if (it == info_.limits.end() || !it->second.has_position_limits)
+        {
+          RCLCPP_FATAL(LOGGER, "Joint '%s' has no URDF position limits - refusing to command it",
+                       name.c_str());
+          return false;
+        }
+        const auto& lim = it->second;
+        const double lo = lim.min_position + soft_limit_margin_;
+        const double hi = lim.max_position - soft_limit_margin_;
+        if (!(lo < hi))
+        {
+          RCLCPP_FATAL(LOGGER, "Joint '%s': soft_limit_margin leaves no range", name.c_str());
+          return false;
+        }
+        command_limits_.push_back(CommandLimit{ name, lo, hi, lim.has_velocity_limits, lim.max_velocity, 0.0 });
+        RCLCPP_INFO(LOGGER, "Soft limits %s: [%.4f, %.4f] rad, %.4f rad/s%s", name.c_str(), lo, hi,
+                    lim.max_velocity, lim.has_velocity_limits ? "" : " (none)");
+        if (!lim.has_velocity_limits)
+        {
+          RCLCPP_WARN(LOGGER, "Joint '%s' has no URDF velocity limit - position limits only", name.c_str());
+        }
+      }
+    }
+  }
+  return true;
+}
+
+void ABBSystemHardware::enforceCommandLimits(double period_s)
+{
+  // Position: clamp into [min, max]. Velocity: the position may move at most
+  // max_velocity x period from the last position sent, and the velocity
+  // command is clamped to +-max_velocity. A clamp means something upstream
+  // (a trajectory validation layer, the JTC) let a bad command through: it is logged.
+  size_t k = 0;
+  bool clamped = false;
+  std::string what;
+  for (auto& group : motion_data_.groups)
+  {
+    for (auto& unit : group.units)
+    {
+      for (auto& joint : unit.joints)
+      {
+        if (k >= command_limits_.size())
+        {
+          return;
+        }
+        auto& lim = command_limits_[k++];
+        const double wanted = joint.command.position;
+        double pos = std::isfinite(wanted) ? wanted : lim.last_position;
+        pos = std::clamp(pos, lim.min_position, lim.max_position);
+        if (lim.has_velocity && period_s > 0.0)
+        {
+          const double step = lim.max_velocity * period_s;
+          pos = std::clamp(pos, lim.last_position - step, lim.last_position + step);
+        }
+        double vel = std::isfinite(joint.command.velocity) ? joint.command.velocity : 0.0;
+        if (lim.has_velocity)
+        {
+          vel = std::clamp(vel, -lim.max_velocity, lim.max_velocity);
+        }
+        if (pos <= lim.min_position || pos >= lim.max_position)
+        {
+          // at a position limit: never push further out
+          if ((pos <= lim.min_position && vel < 0.0) || (pos >= lim.max_position && vel > 0.0))
+          {
+            vel = 0.0;
+          }
+        }
+        if (!(std::abs(pos - wanted) <= 1e-9) || !(std::abs(vel - joint.command.velocity) <= 1e-9))
+        {
+          clamped = true;
+          what = lim.name;
+        }
+        joint.command.position = pos;
+        joint.command.velocity = vel;
+        lim.last_position = pos;
+      }
+    }
+  }
+  if (clamped)
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_limit_log_ >= std::chrono::seconds(1))
+    {
+      last_limit_log_ = now;
+      RCLCPP_ERROR(LOGGER, "soft limits: command for %s clamped to its URDF limits", what.c_str());
+    }
+  }
 }
 
 std::vector<hardware_interface::StateInterface> ABBSystemHardware::export_state_interfaces()
@@ -339,6 +461,16 @@ CallbackReturn ABBSystemHardware::on_activate(const rclcpp_lifecycle::State& /* 
     }
   }
 
+  // Soft limits: the velocity bound starts from the actual position.
+  {
+    size_t k = 0;
+    for (const auto& group : motion_data_.groups)
+      for (const auto& unit : group.units)
+        for (const auto& joint : unit.joints)
+          if (k < command_limits_.size())
+            command_limits_[k++].last_position = joint.state.position;
+  }
+
   // A fresh session: supervision starts over (an activation only happens
   // once EGM streams again - see the wait above).
   egm_not_ok_ = false;
@@ -413,7 +545,7 @@ return_type ABBSystemHardware::read(const rclcpp::Time& /*time*/, const rclcpp::
   return return_type::OK;
 }
 
-return_type ABBSystemHardware::write(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/)
+return_type ABBSystemHardware::write(const rclcpp::Time& /*time*/, const rclcpp::Duration& period)
 {
   if (egm_lost_)
   {
@@ -421,6 +553,7 @@ return_type ABBSystemHardware::write(const rclcpp::Time& /*time*/, const rclcpp:
                  egm_lost_reason_.c_str());
     return return_type::DEACTIVATE;
   }
+  enforceCommandLimits(period.seconds());
   egm_manager_->write(motion_data_);
   return return_type::OK;
 }
