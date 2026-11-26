@@ -177,9 +177,42 @@ CallbackReturn ABBSystemHardware::on_init(const hardware_interface::HardwareInfo
       return CallbackReturn::ERROR;
     }
 
-    // Get robot controller description from RWS
-    abb::robot::RWSManager rws_manager(rws_ip, rws_port, "Default User", "robotics");
-    robot_controller_description_ = abb::robot::utilities::establishRWSConnection(rws_manager, "IRB1200", true);
+    // Get robot controller description from RWS. The manager (and its RWS
+    // session, logged out by librws when it is destroyed) lives only for
+    // this block. Bounded, as in the ROS 1 driver (30 s for the description):
+    // waiting forever kept retrying - and holding a start-up hostage - when
+    // the controller's session table was full ("503 Too many sessions").
+    const auto nick_it = info_.hardware_parameters.find("rws_robot_nickname");
+    const std::string nickname = nick_it == info_.hardware_parameters.end() ? "IRB1200" : nick_it->second;
+    static constexpr auto RWS_TIMEOUT = std::chrono::seconds(30);
+    const auto deadline = std::chrono::steady_clock::now() + RWS_TIMEOUT;
+    bool described = false;
+    {
+      abb::robot::RWSManager rws_manager(rws_ip, rws_port, "Default User", "robotics");
+      while (rclcpp::ok() && !described)
+      {
+        try
+        {
+          robot_controller_description_ = rws_manager.collectAndParseSystemData(nickname);
+          described = true;
+        }
+        catch (const std::exception& e)
+        {
+          if (std::chrono::steady_clock::now() >= deadline)
+          {
+            RCLCPP_FATAL(LOGGER, "No robot controller description via RWS within %ld s: %s",
+                         static_cast<long>(RWS_TIMEOUT.count()), e.what());
+            return CallbackReturn::ERROR;
+          }
+          RCLCPP_WARN(LOGGER, "RWS connection failed (%s), retrying", e.what());
+          rclcpp::sleep_for(1s);
+        }
+      }
+    }
+    if (!described)
+    {
+      return CallbackReturn::ERROR;
+    }
   }
   else
   {

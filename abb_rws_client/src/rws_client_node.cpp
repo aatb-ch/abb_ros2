@@ -17,8 +17,14 @@ int main(int argc, char** argv)
   client_node->get_parameter<std::string>("robot_ip", robot_ip);
   client_node->get_parameter<int>("robot_port", robot_port);
 
-  abb_rws_client::RWSServiceProviderROS srv_provider(client_node, robot_ip, robot_port);
-  abb_rws_client::RWSStatePublisherROS state_publisher(client_node, robot_ip, robot_port);
+  // One RWS manager (one session pair: polling and services each use their
+  // own interface) for the whole node; librws logs both sessions out when it
+  // is destroyed, i.e. on a clean shutdown (SIGINT/SIGTERM end spin()).
+  auto rws_manager = std::make_shared<abb::robot::RWSManager>(
+      robot_ip, static_cast<unsigned short>(robot_port), abb::rws::SystemConstants::General::DEFAULT_USERNAME,
+      abb::rws::SystemConstants::General::DEFAULT_PASSWORD);
+  abb_rws_client::RWSServiceProviderROS srv_provider(client_node, rws_manager);
+  abb_rws_client::RWSStatePublisherROS state_publisher(client_node, rws_manager);
 
   rclcpp::executors::MultiThreadedExecutor exec;
   exec.add_node(client_node);

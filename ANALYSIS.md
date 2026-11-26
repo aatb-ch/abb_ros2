@@ -213,4 +213,36 @@ bursts up to ~900 ms, 1.6 % loss, EGM inter-arrival bunching up to 213 ms.
 
 ## Status
 
-PR 1: this file.
+| PR | content | merged |
+|---|---|---|
+| #1 | imported fixes (zero jump, prefixed joints, EGM-loss deactivation, soft limits) + this analysis | yes |
+| #2 | fake-robot EGM test harness, `scripts/test_jazzy.sh`, pinned dependencies | yes |
+| A | idle/stale safety: no stale hold target, no velocity residue, hold what was sent, answer EGM while inactive, drain on activate | see PR |
+| B | session supervision: robot-reported stops at once, grace only for silence, seqno dedupe, activation/switch guards, diagnostics | see PR |
+| C | per-sent-packet step limit (`egm_max_step_scale`, default off) | see PR |
+| D+E | `velocity_command_mode` (default unchanged), joint bounds never wider than the controller's | see PR |
+| F | rws_client callback groups, one RWS session pair, bounded RWS wait in the hardware | see PR |
+
+### Owner decisions pending
+- `egm_max_step_scale` (default off): enable it, at 1.0 (max velocity per EGM sample)?
+- `velocity_command_mode` (default `feedforward`): position_only / scaled, after a tuning matrix on the robot (no oscillation on step trajectories).
+- `egm_loss_grace_ms` (default 50 ms): a Wi-Fi link needed 500 ms; a longer grace only delays the stop on silence.
+
+### Known limits (not fixed here)
+- **Lost replies.** If the link drops replies while robot messages still arrive (e.g. at the start of a blackout), the robot can see more than one step at once. The step limit is relative to what the driver sent; the robot's own EGM speed supervision (`\MaxSpeedDeviation`) is the complement.
+- **The first reply after a gap** can carry a write from the gap's first 10 ms (the managers forward writes until 5 reads without a new message). Bounded by 5 controller cycles of motion, or one step with the step limit.
+- **Deferred:** EGM state as state interfaces (ROS 1 `abb_egm_state_controller`); an RWS poll failure publishes the all-false default state (as ROS 1).
+
+### Simulator e2e (IRC5 RWS+EGM simulator, laggy EGM link)
+60 s idle, then a controller stop mid-move, a RAPID stop mid-move + restart + re-arm, then 25 moves at 60-120 deg/s over netem on the EGM port: 30 +- 30 ms delay each way (paretonormal), 1.6 % loss, 1 % duplicates, reordering, and blackouts of 200-900 ms every 3-8 s. 500 Hz controller manager, `egm_loss_grace_ms` 500. "stock" = the imported fixes (#1); C and F with `egm_max_step_scale` 1.0, Fdef = F with defaults. "Sent step" = between consecutive replies in the driver's own sequence order (what the driver sent); "received step" = in arrival order, which includes the link's reordering. Limit = max velocity x 4 ms. One run per variant (random blackouts): compare orders of magnitude, not single digits.
+
+| variant | idle distinct/replies | travel after JTC stop [deg] | snap after re-arm (RAPID) [deg] | laggy: max sent step [deg] (x limit, n over/n) | laggy: max received step [deg] (n over/n) | faults | travel fault->re-arm [deg] | snap after fault re-arm [deg] | sim errors |
+|---|---|---|---|---|---|---|---|---|---|
+| stock | 1/15003 | 28.705 | 0.0 | 22.91 (17.802x, 132/5262) | 38.565 (2387/5419) | 2 | 1.283 | 0 | 0 |
+| A | 1/14996 | 25.64 | 0.0 | 15.502 (12.503x, 180/4900) | 16.276 (2241/5048) | 0 | 0 | 0 | 0 |
+| B | 1/15001 | 19.015 | 0.0 | 34.454 (49.219x, 180/5064) | 34.714 (2223/5208) | 1 | 4.187 | 0 | 0 |
+| C | 1/14998 | 21.758 | 0.0 | 2.542 (2.0x, 7/5265) | 12.137 (2012/5416) | 2 | 2.998 | 0 | 0 |
+| F | 1/15001 | 26.928 | 0.0 | 4.431 (3.0x, 5/5083) | 14.76 (1809/5226) | 2 | 0.584 | 0 | 0 |
+| Fdef | 1/15004 | 28.648 | 0.0 | 2.401 (1.668x, 6/5107) | 14.27 (1914/5227) | 2 | 1.773 | 0 | 0 |
+
+RWS (rws_client at 5 Hz polling, 150 ms each way on the RWS port, `get_speed_ratio` x 3, two driver starts): stock answered 1 of 6 calls (8.1 s), 5 timed out after 20 s; F answered 6 of 6 in 0.5-0.6 s. RWS sessions over the two starts: stock 8, F 4 (both logged out on a clean shutdown).
