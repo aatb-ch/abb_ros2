@@ -23,6 +23,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,13 @@ public:
 
   ROS2_CONTROL_DRIVER_PUBLIC
   CallbackReturn on_activate(const rclcpp_lifecycle::State& previous_state) override;
+
+  ROS2_CONTROL_DRIVER_PUBLIC
+  CallbackReturn on_deactivate(const rclcpp_lifecycle::State& previous_state) override;
+
+  ROS2_CONTROL_DRIVER_PUBLIC
+  return_type perform_command_mode_switch(const std::vector<std::string>& start_interfaces,
+                                          const std::vector<std::string>& stop_interfaces) override;
 
   ROS2_CONTROL_DRIVER_PUBLIC
   return_type read(const rclcpp::Time& time, const rclcpp::Duration& period) override;
@@ -98,6 +106,38 @@ private:
   std::vector<CommandLimit> command_limits_;
   double soft_limit_margin_{ 0.00872665 };   // rad (0.5 deg) inside the URDF limits
   std::chrono::steady_clock::time_point last_limit_log_{};
+
+  // Idle hold: while no controller claims a joint's position command
+  // interface, the robot gets a constant target with velocity 0 - the last
+  // command (after a controller release / deactivation), re-latched ONCE
+  // from the robot's own reference at activation and at every EGM session
+  // (re)start. Never re-sampled while the robot servos on it. While the
+  // hardware is inactive, read() answers EGM with it.
+  void latchHold(const char* why);
+  void holdLastCommand();
+  void applyHold();
+  void answerEgmWithHold(double period_s);
+  void trackSession();
+  void drainEgm();
+  bool anyPositionClaimed() const;
+  std::vector<std::string> joint_names_;   // exported names, motion_data_ order
+  std::vector<double> hold_position_;      // latched target [rad or m]
+  bool hold_valid_{ false };
+  std::vector<bool> claimed_position_;
+  std::vector<bool> claimed_velocity_;
+  bool active_{ false };
+  bool have_states_{ false };
+  bool session_running_{ false };
+  uint32_t last_seqno_{ 0 };
+
+  // What the robot actually got: the robot sends its next message only after
+  // our reply to the previous one, so when a new sequence number arrives,
+  // the last position written (pending_) went out (last_sent_). During an
+  // inbound gap a controller keeps writing, but none of it is sent.
+  void notePending();
+  std::vector<double> last_sent_;
+  std::vector<double> pending_;
+  uint32_t last_seen_seqno_{ 0 };
 };
 
 }  // namespace abb_hardware_interface
