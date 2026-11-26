@@ -77,6 +77,40 @@ CallbackReturn ABBSystemHardware::on_init(const hardware_interface::HardwareInfo
     RCLCPP_INFO(LOGGER, "Per-packet step limit: %.2f x max_velocity per EGM sample", max_step_scale_);
   }
 
+  // EGM speedRef feed-forward, see shapeVelocity().
+  const auto vmode_it = info_.hardware_parameters.find("velocity_command_mode");
+  if (vmode_it != info_.hardware_parameters.end())
+  {
+    if (vmode_it->second == "feedforward")
+    {
+      velocity_mode_ = VelocityMode::FEEDFORWARD;
+    }
+    else if (vmode_it->second == "position_only")
+    {
+      velocity_mode_ = VelocityMode::POSITION_ONLY;
+    }
+    else if (vmode_it->second == "scaled")
+    {
+      velocity_mode_ = VelocityMode::SCALED;
+    }
+    else
+    {
+      RCLCPP_FATAL(LOGGER, "velocity_command_mode '%s': expected feedforward, position_only or scaled",
+                   vmode_it->second.c_str());
+      return CallbackReturn::ERROR;
+    }
+  }
+  const auto vscale_it = info_.hardware_parameters.find("velocity_feedforward_scale");
+  if (vscale_it != info_.hardware_parameters.end())
+  {
+    velocity_scale_ = std::stod(vscale_it->second);
+    if (!(velocity_scale_ >= 0.0 && velocity_scale_ <= 1.0))
+    {
+      RCLCPP_FATAL(LOGGER, "velocity_feedforward_scale must be in [0, 1]");
+      return CallbackReturn::ERROR;
+    }
+  }
+
   // Validate interfaces configured in ros2_control xacro.
   for (const hardware_interface::ComponentInfo& joint : info_.joints)
   {
@@ -298,8 +332,24 @@ bool ABBSystemHardware::initCommandLimits()
           return false;
         }
         const auto& lim = it->second;
-        const double lo = lim.min_position + soft_limit_margin_;
-        const double hi = lim.max_position - soft_limit_margin_;
+        // As the ROS 1 driver (egm_hardware_interface.cpp:631-652): never
+        // wider than the bounds the robot controller reports (via RWS, or the
+        // ros2_control min/max without RWS). abb_egm_rws_managers throws on a
+        // command outside those bounds, which puts the hardware into ERROR.
+        double lo_bound = lim.min_position;
+        double hi_bound = lim.max_position;
+        if (joint.lower_limit < joint.upper_limit)
+        {
+          if (joint.lower_limit > lo_bound + 1e-9 || joint.upper_limit < hi_bound - 1e-9)
+          {
+            RCLCPP_WARN(LOGGER, "Joint '%s': URDF limits [%.4f, %.4f] narrowed to the robot controller's [%.4f, %.4f]",
+                        name.c_str(), lo_bound, hi_bound, joint.lower_limit, joint.upper_limit);
+          }
+          lo_bound = std::max(lo_bound, joint.lower_limit);
+          hi_bound = std::min(hi_bound, joint.upper_limit);
+        }
+        const double lo = lo_bound + soft_limit_margin_;
+        const double hi = hi_bound - soft_limit_margin_;
         if (!(lo < hi))
         {
           RCLCPP_FATAL(LOGGER, "Joint '%s': soft_limit_margin leaves no range", name.c_str());
@@ -722,6 +772,25 @@ void ABBSystemHardware::answerEgmWithHold(double period_s)
   egm_manager_->write(motion_data_);
 }
 
+void ABBSystemHardware::shapeVelocity()
+{
+  // Feed-forward of the controller's velocity into EGM speedRef. With
+  // pos_corr_gain < 1 on the robot, a full feed-forward made fast moves
+  // overshoot their target (10 % at 60 deg/s, 43 % at 120 deg/s with a
+  // reversal on a virtual controller); position_only removed it (0.3-0.8 %)
+  // at the cost of ~140 ms more lag. Which one to use depends on the robot's
+  // EGM settings: tune on the robot.
+  if (velocity_mode_ == VelocityMode::FEEDFORWARD)
+  {
+    return;
+  }
+  const double scale = velocity_mode_ == VelocityMode::SCALED ? velocity_scale_ : 0.0;
+  for (auto& group : motion_data_.groups)
+    for (auto& unit : group.units)
+      for (auto& joint : unit.joints)
+        joint.command.velocity *= scale;
+}
+
 void ABBSystemHardware::enforcePacketStep()
 {
   // Limit the step per EGM reply relative to the reply actually SENT before
@@ -1015,6 +1084,7 @@ return_type ABBSystemHardware::write(const rclcpp::Time& /*time*/, const rclcpp:
     return return_type::DEACTIVATE;
   }
   applyHold();
+  shapeVelocity();
   enforceCommandLimits(period.seconds());
   enforcePacketStep();
   notePending();

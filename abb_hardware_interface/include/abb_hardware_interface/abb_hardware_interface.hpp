@@ -163,6 +163,19 @@ private:
   double sample_time_s_{ 0.004 };   // from the robot's header time stamps (4 ms until known)
   bool sample_time_known_{ false };
   std::chrono::steady_clock::time_point last_step_log_{};
+
+  // EGM speedRef feed-forward (velocity_command_mode): "feedforward" sends
+  // the controller's velocity (default, upstream behaviour), "position_only"
+  // sends 0, "scaled" sends velocity_feedforward_scale x the velocity.
+  enum class VelocityMode
+  {
+    FEEDFORWARD,
+    POSITION_ONLY,
+    SCALED
+  };
+  VelocityMode velocity_mode_{ VelocityMode::FEEDFORWARD };
+  double velocity_scale_{ 1.0 };
+  void shapeVelocity();
 };
 
 }  // namespace abb_hardware_interface
