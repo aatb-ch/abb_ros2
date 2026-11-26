@@ -276,7 +276,27 @@ CallbackReturn ABBSystemHardware::on_activate(const rclcpp_lifecycle::State& /* 
     rclcpp::sleep_for(500ms);
   }
 
-  egm_manager_->read(motion_data_);
+  // EGMManager::Channel::read() only takes over the joint states once the
+  // channel counts as active, i.e. once a message with a sequence number
+  // different from the previous one was read. The first message of an EGM
+  // session has seqno 0, equal to the default-constructed "previous" header,
+  // so a single read() here leaves every joint state at 0.0 - and the command
+  // below would then send the robot to all-zero joint angles. Keep reading
+  // until real states arrived.
+  bool have_states = false;
+  for (size_t i = 0; i < NUM_CONNECTION_TRIES && rclcpp::ok() && !have_states; ++i)
+  {
+    have_states = egm_manager_->read(motion_data_);
+    if (!have_states)
+    {
+      egm_manager_->waitForMessage(500);
+    }
+  }
+  if (!have_states)
+  {
+    RCLCPP_ERROR(LOGGER, "No joint states received over EGM");
+    return CallbackReturn::ERROR;
+  }
   for (auto& group : motion_data_.groups)
   {
     for (auto& unit : group.units)
