@@ -253,10 +253,11 @@ private:
   {
     using namespace abb::egm;
     EgmRobot msg;
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(since_start).count();
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(since_start).count();
     msg.mutable_header()->set_seqno(seqno_);
-    msg.mutable_header()->set_tm(static_cast<uint32_t>(ms));
+    // The controller clock: one sample per message.
+    tm_ms_ += static_cast<uint32_t>(period.count());
+    msg.mutable_header()->set_tm(tm_ms_);
     msg.mutable_header()->set_mtype(EgmHeader_MessageType_MSGTYPE_DATA);
     auto fill = [&](auto* joints, bool measured) {
       for (int i = 0; i < 6; ++i)
@@ -361,6 +362,7 @@ private:
   double max_speed_dps_{ 1e9 };
   double utilization_{ 50.0 };
   uint32_t seqno_{ 0 };
+  uint32_t tm_ms_{ 0 };
   uint32_t last_seqno_{ 0 };
   uint32_t sent_{ 0 };
   std::vector<EgmReply> replies_;

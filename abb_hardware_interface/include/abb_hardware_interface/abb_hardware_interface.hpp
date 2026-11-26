@@ -96,6 +96,7 @@ private:
   {
     bool seen{ false };
     uint32_t seqno{ 0 };
+    uint32_t stamp_ms{ 0 };
     std::chrono::steady_clock::time_point last_new{};
     bool silent{ false };
   };
@@ -152,7 +153,16 @@ private:
   void notePending();
   std::vector<double> last_sent_;
   std::vector<double> pending_;
-  uint32_t last_seen_seqno_{ 0 };
+
+  // Per-sent-packet step limit (egm_max_step_scale > 0; off by default): the
+  // position sent may differ from the position SENT with the previous EGM
+  // reply by at most scale x max_velocity x the robot's sample time.
+  void enforcePacketStep();
+  double max_step_scale_{ 0.0 };
+  bool new_message_{ false };       // a new sequence number in this read()
+  double sample_time_s_{ 0.004 };   // from the robot's header time stamps (4 ms until known)
+  bool sample_time_known_{ false };
+  std::chrono::steady_clock::time_point last_step_log_{};
 };
 
 }  // namespace abb_hardware_interface
