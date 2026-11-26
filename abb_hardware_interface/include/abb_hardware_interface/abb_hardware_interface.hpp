@@ -71,6 +71,16 @@ private:
 
   // Store the state and commands for the robot(s)
   abb::robot::MotionData motion_data_;
+
+  // EGM session supervision (see read()/write()): when EGM stops streaming
+  // or stops running, the hardware deactivates itself so ros2_control
+  // deactivates the controllers commanding it.
+  bool egmSessionOk(std::string& why) const;
+  std::chrono::steady_clock::time_point egm_not_ok_since_{};
+  bool egm_not_ok_{ false };
+  bool egm_lost_{ false };
+  std::string egm_lost_reason_;
+  std::chrono::milliseconds egm_loss_grace_{ 50 };
 };
 
 }  // namespace abb_hardware_interface

@@ -54,6 +54,14 @@ CallbackReturn ABBSystemHardware::on_init(const hardware_interface::HardwareInfo
     return CallbackReturn::ERROR;
   }
 
+  // How long the EGM session may be not streaming / not running before the
+  // hardware deactivates itself. Default 50 ms (~12 EGM cycles).
+  const auto grace_it = info_.hardware_parameters.find("egm_loss_grace_ms");
+  if (grace_it != info_.hardware_parameters.end())
+  {
+    egm_loss_grace_ = std::chrono::milliseconds(std::stoi(grace_it->second));
+  }
+
   // Validate interfaces configured in ros2_control xacro.
   for (const hardware_interface::ComponentInfo& joint : info_.joints)
   {
@@ -331,19 +339,88 @@ CallbackReturn ABBSystemHardware::on_activate(const rclcpp_lifecycle::State& /* 
     }
   }
 
+  // A fresh session: supervision starts over (an activation only happens
+  // once EGM streams again - see the wait above).
+  egm_not_ok_ = false;
+  egm_lost_ = false;
+  egm_lost_reason_.clear();
+
   RCLCPP_INFO(LOGGER, "ros2_control hardware interface was successfully started!");
 
   return CallbackReturn::SUCCESS;
 }
 
-return_type ABBSystemHardware::read(const rclcpp::Time& time, const rclcpp::Duration& period)
+bool ABBSystemHardware::egmSessionOk(std::string& why) const
+{
+  for (const auto& group : motion_data_.groups)
+  {
+    const auto& channel = group.egm_channel_data;
+    if (!channel.is_active)
+    {
+      why = "EGM channel '" + channel.name + "' stopped streaming";
+      return false;
+    }
+    if (channel.input.status().egm_state() != abb::egm::wrapper::Status::EGM_RUNNING)
+    {
+      why = "EGM on channel '" + channel.name + "' is not running (" +
+            abb::egm::wrapper::Status::EGMState_Name(channel.input.status().egm_state()) + ")";
+      return false;
+    }
+    if (channel.input.status().rapid_execution_state() != abb::egm::wrapper::Status::RAPID_RUNNING)
+    {
+      why = "RAPID is not running (channel '" + channel.name + "')";
+      return false;
+    }
+  }
+  return true;
+}
+
+return_type ABBSystemHardware::read(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/)
 {
   egm_manager_->read(motion_data_);
+
+  // EGM session supervision. Upstream keeps the
+  // hardware and its controllers active when EGM goes away: the channel
+  // just stops updating (the joint states freeze with fresh stamps), the
+  // JTC keeps interpolating into nothing and reports success, and when EGM
+  // comes back the robot jumps to wherever the JTC's command is by then.
+  // Here a session that is not streaming/running for longer than the grace
+  // period latches egm_lost_, and write() returns DEACTIVATE: the
+  // controller_manager deactivates this hardware and every controller
+  // claiming its command interfaces. Activating it again (on_activate)
+  // re-seeds command = state, and a re-activated JTC holds the actual
+  // position - never a jump. The ROS 1 abb_robot_driver did the same with
+  // a controller reset + egm_controller_stopper.
+  std::string why;
+  if (egmSessionOk(why))
+  {
+    egm_not_ok_ = false;
+  }
+  else
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (!egm_not_ok_)
+    {
+      egm_not_ok_ = true;
+      egm_not_ok_since_ = now;
+    }
+    if (!egm_lost_ && now - egm_not_ok_since_ >= egm_loss_grace_)
+    {
+      egm_lost_ = true;
+      egm_lost_reason_ = why;
+    }
+  }
   return return_type::OK;
 }
 
-return_type ABBSystemHardware::write(const rclcpp::Time& time, const rclcpp::Duration& period)
+return_type ABBSystemHardware::write(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/)
 {
+  if (egm_lost_)
+  {
+    RCLCPP_ERROR(LOGGER, "%s - deactivating the hardware and its controllers (activate it again once EGM runs)",
+                 egm_lost_reason_.c_str());
+    return return_type::DEACTIVATE;
+  }
   egm_manager_->write(motion_data_);
   return return_type::OK;
 }
