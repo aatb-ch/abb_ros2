@@ -54,7 +54,8 @@ struct EgmReply
 class FakeEgmRobot
 {
 public:
-  FakeEgmRobot(uint16_t egm_port, const Joints& start) : egm_port_(egm_port), position_(start)
+  FakeEgmRobot(uint16_t egm_port, const Joints& start)
+    : egm_port_(egm_port), position_(start), reference_(start)
   {
     sock_ = ::socket(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in local{};
@@ -120,6 +121,23 @@ public:
   {
     std::lock_guard<std::mutex> l(m_);
     position_ = p;
+    reference_ = p;
+  }
+  // Measured = reference + sag (servo error under gravity) + noise.
+  void setSag(const Joints& sag)
+  {
+    std::lock_guard<std::mutex> l(m_);
+    sag_ = sag;
+  }
+  void setNoise(double amplitude_deg)
+  {
+    std::lock_guard<std::mutex> l(m_);
+    noise_ = amplitude_deg;
+  }
+  Joints reference() const
+  {
+    std::lock_guard<std::mutex> l(m_);
+    return reference_;
   }
   Joints position() const
   {
@@ -213,9 +231,15 @@ private:
     msg.mutable_header()->set_seqno(seqno_);
     msg.mutable_header()->set_tm(static_cast<uint32_t>(ms));
     msg.mutable_header()->set_mtype(EgmHeader_MessageType_MSGTYPE_DATA);
-    auto fill = [&](auto* joints) {
-      for (double v : position_)
+    auto fill = [&](auto* joints, bool measured) {
+      for (int i = 0; i < 6; ++i)
       {
+        double v = measured ? position_[i] + sag_[i] : reference_[i];
+        if (measured && noise_ > 0.0)
+        {
+          rng_ = rng_ * 6364136223846793005ULL + 1442695040888963407ULL;
+          v += noise_ * (static_cast<double>(rng_ >> 11) / 9007199254740992.0 * 2.0 - 1.0);
+        }
         joints->add_joints(v);
       }
     };
@@ -235,10 +259,10 @@ private:
       c->set_sec(static_cast<uint64_t>(us / 1000000) + 1000);
       c->set_usec(static_cast<uint64_t>(us % 1000000));
     };
-    fill(msg.mutable_feedback()->mutable_joints());
+    fill(msg.mutable_feedback()->mutable_joints(), true);
     pose(msg.mutable_feedback()->mutable_cartesian());
     clock(msg.mutable_feedback()->mutable_time());
-    fill(msg.mutable_planned()->mutable_joints());
+    fill(msg.mutable_planned()->mutable_joints(), false);
     pose(msg.mutable_planned()->mutable_cartesian());
     clock(msg.mutable_planned()->mutable_time());
     msg.mutable_motorstate()->set_state(motors_on_ ? EgmMotorState_MotorStateType_MOTORS_ON :
@@ -271,7 +295,12 @@ private:
     }
     std::lock_guard<std::mutex> l(m_);
     r.robot_seqno = last_seqno_;
-    if (follow_ && s.planned().joints().joints_size() >= 6 && motors_on_ && egm_running_ && rapid_running_)
+    const bool moving = s.planned().joints().joints_size() >= 6 && motors_on_ && egm_running_ && rapid_running_;
+    if (moving)
+    {
+      reference_ = r.position;  // the robot's reference follows the EGM command
+    }
+    if (follow_ && moving)
     {
       const double max_step = max_speed_dps_ * std::chrono::duration<double>(period).count();
       for (int i = 0; i < 6; ++i)
@@ -292,6 +321,10 @@ private:
   mutable std::mutex m_;
   std::condition_variable cv_;
   Joints position_;
+  Joints reference_;
+  Joints sag_{};
+  double noise_{ 0.0 };
+  uint64_t rng_{ 42 };
   bool motors_on_{ true };
   bool egm_running_{ true };
   bool rapid_running_{ true };

@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 using namespace std::chrono_literals;
 
@@ -244,6 +245,14 @@ CallbackReturn ABBSystemHardware::on_init(const hardware_interface::HardwareInfo
     return CallbackReturn::ERROR;
   }
 
+  joint_names_.clear();
+  for (const auto& group : motion_data_.groups)
+    for (const auto& unit : group.units)
+      for (const auto& joint : unit.joints)
+        joint_names_.push_back(urdfJointName(joint.name, info_.joints));
+  claimed_position_.assign(joint_names_.size(), false);
+  claimed_velocity_.assign(joint_names_.size(), false);
+
   return CallbackReturn::SUCCESS;
 }
 
@@ -449,26 +458,25 @@ CallbackReturn ABBSystemHardware::on_activate(const rclcpp_lifecycle::State& /* 
     RCLCPP_ERROR(LOGGER, "No joint states received over EGM");
     return CallbackReturn::ERROR;
   }
-  for (auto& group : motion_data_.groups)
-  {
-    for (auto& unit : group.units)
-    {
-      for (auto& joint : unit.joints)
-      {
-        joint.command.position = joint.state.position;
-        joint.command.velocity = 0.0;
-      }
-    }
-  }
+  have_states_ = true;
 
-  // Soft limits: the velocity bound starts from the actual position.
+  // Messages may have queued up while nothing answered them (abb_libegm
+  // serves one datagram at a time and waits up to 24 ms for an answer to
+  // each): answer them all, so the target below is latched from the newest
+  // message and not from one that is hundreds of ms old.
+  drainEgm();
+
+  // No controller claims anything yet: hold the robot's own reference,
+  // latched once. A controller activated afterwards starts from it.
+  std::fill(claimed_position_.begin(), claimed_position_.end(), false);
+  std::fill(claimed_velocity_.begin(), claimed_velocity_.end(), false);
+  latchHold("activation");
+  applyHold();
+
+  // Soft limits: the step bound starts from the target that is sent.
+  for (size_t k = 0; k < command_limits_.size() && k < hold_position_.size(); ++k)
   {
-    size_t k = 0;
-    for (const auto& group : motion_data_.groups)
-      for (const auto& unit : group.units)
-        for (const auto& joint : unit.joints)
-          if (k < command_limits_.size())
-            command_limits_[k++].last_position = joint.state.position;
+    command_limits_[k].last_position = hold_position_[k];
   }
 
   // A fresh session: supervision starts over (an activation only happens
@@ -477,9 +485,250 @@ CallbackReturn ABBSystemHardware::on_activate(const rclcpp_lifecycle::State& /* 
   egm_lost_ = false;
   egm_lost_reason_.clear();
 
+  active_ = true;
   RCLCPP_INFO(LOGGER, "ros2_control hardware interface was successfully started!");
 
   return CallbackReturn::SUCCESS;
+}
+
+CallbackReturn ABBSystemHardware::on_deactivate(const rclcpp_lifecycle::State& /*previous_state*/)
+{
+  // ros2_control deactivates the controllers claiming this hardware's
+  // command interfaces along with it: keep the last position the robot got
+  // (not one written but never sent, e.g. during a link gap), drop the
+  // velocity. read() keeps answering EGM with it while inactive.
+  active_ = false;
+  std::fill(claimed_position_.begin(), claimed_position_.end(), false);
+  std::fill(claimed_velocity_.begin(), claimed_velocity_.end(), false);
+  holdLastCommand();
+  return CallbackReturn::SUCCESS;
+}
+
+return_type ABBSystemHardware::perform_command_mode_switch(const std::vector<std::string>& start_interfaces,
+                                                          const std::vector<std::string>& stop_interfaces)
+{
+  // Track which joints' interfaces a controller claims. When the last
+  // position claim goes away, the robot keeps the last position it got (no
+  // re-sampling) but no longer a velocity: a controller stopped mid-motion
+  // would otherwise leave its last speed reference behind.
+  const bool claimed_before = anyPositionClaimed();
+  auto update = [&](const std::vector<std::string>& interfaces, bool claim) {
+    for (const auto& full_name : interfaces)
+    {
+      for (size_t k = 0; k < joint_names_.size(); ++k)
+      {
+        if (full_name == joint_names_[k] + "/" + hardware_interface::HW_IF_POSITION)
+        {
+          claimed_position_[k] = claim;
+        }
+        else if (full_name == joint_names_[k] + "/" + hardware_interface::HW_IF_VELOCITY)
+        {
+          claimed_velocity_[k] = claim;
+        }
+      }
+    }
+  };
+  update(stop_interfaces, false);
+  update(start_interfaces, true);
+  if (claimed_before && !anyPositionClaimed())
+  {
+    holdLastCommand();
+  }
+  return return_type::OK;
+}
+
+bool ABBSystemHardware::anyPositionClaimed() const
+{
+  return std::find(claimed_position_.begin(), claimed_position_.end(), true) != claimed_position_.end();
+}
+
+void ABBSystemHardware::latchHold(const char* why)
+{
+  // The hold target is the robot's OWN reference (EGM "planned" joints) when
+  // the robot reports it, else the measured position - taken once. Unlike the
+  // ROS 1 driver (command = measured position on every read), it is never
+  // re-sampled while idle: a reference that follows the measurement each
+  // cycle follows encoder noise and servo error, and the arm can creep or sag.
+  // The planned position also has no servo lag, so latching it during motion
+  // does not step the reference backwards.
+  hold_position_.clear();
+  bool all_planned = true;
+  for (const auto& group : motion_data_.groups)
+  {
+    const auto& planned = group.egm_channel_data.input.planned();
+    const auto& robot = planned.robot().joints().position();
+    const auto& external = planned.external().joints().position();
+    int ri = 0;
+    int ei = 0;
+    for (const auto& unit : group.units)
+    {
+      const bool is_robot = unit.active && unit.type == abb::robot::MechanicalUnit_Type_TCP_ROBOT;
+      const bool is_external = unit.active && (unit.type == abb::robot::MechanicalUnit_Type_ROBOT ||
+                                               unit.type == abb::robot::MechanicalUnit_Type_SINGLE);
+      for (const auto& joint : unit.joints)
+      {
+        const double f = joint.rotational ? abb::robot::Constants::DEG_TO_RAD : abb::robot::Constants::MM_TO_M;
+        double p = std::numeric_limits<double>::quiet_NaN();
+        if (is_robot && ri < robot.values_size())
+        {
+          p = robot.values(ri) * f;
+        }
+        else if (is_external && ei < external.values_size())
+        {
+          p = external.values(ei) * f;
+        }
+        ri += is_robot ? 1 : 0;
+        ei += is_external ? 1 : 0;
+        if (!std::isfinite(p))
+        {
+          p = joint.state.position;
+          all_planned = false;
+        }
+        hold_position_.push_back(p);
+      }
+    }
+  }
+  hold_valid_ = true;
+  last_sent_ = hold_position_;  // the robot's own reference
+  pending_ = hold_position_;
+  if (why)
+  {
+    RCLCPP_INFO(LOGGER, "Idle hold latched (%s) from the robot's %s position", why,
+                all_planned ? "planned (reference)" : "measured");
+  }
+}
+
+void ABBSystemHardware::holdLastCommand()
+{
+  if (!have_states_ || last_sent_.empty())
+  {
+    return;
+  }
+  hold_position_ = last_sent_;
+  hold_valid_ = true;
+  applyHold();
+}
+
+void ABBSystemHardware::notePending()
+{
+  pending_.clear();
+  for (const auto& group : motion_data_.groups)
+    for (const auto& unit : group.units)
+      for (const auto& joint : unit.joints)
+        pending_.push_back(joint.command.position);
+}
+
+void ABBSystemHardware::applyHold()
+{
+  // Joints whose position no controller claims get the latched target;
+  // velocities no controller claims are 0.
+  if (!hold_valid_)
+  {
+    return;
+  }
+  size_t k = 0;
+  for (auto& group : motion_data_.groups)
+  {
+    for (auto& unit : group.units)
+    {
+      for (auto& joint : unit.joints)
+      {
+        if (k < hold_position_.size() && !claimed_position_[k])
+        {
+          joint.command.position = hold_position_[k];
+        }
+        if (k < claimed_velocity_.size() && !claimed_velocity_[k])
+        {
+          joint.command.velocity = 0.0;
+        }
+        ++k;
+      }
+    }
+  }
+}
+
+void ABBSystemHardware::answerEgmWithHold(double period_s)
+{
+  if (!hold_valid_)
+  {
+    return;
+  }
+  applyHold();
+  // The target is constant (or the robot's own reference): no step bound
+  // from an older command.
+  for (size_t k = 0; k < command_limits_.size() && k < hold_position_.size(); ++k)
+  {
+    command_limits_[k].last_position = hold_position_[k];
+  }
+  enforceCommandLimits(period_s);
+  notePending();
+  egm_manager_->write(motion_data_);
+}
+
+void ABBSystemHardware::trackSession()
+{
+  // An EGM session (re)starts when the robot reports EGM running + RAPID
+  // running + motors on again, or when the sequence number restarts. A
+  // session that starts while nothing claims the interfaces gets a freshly
+  // latched target: the arm may have been moved (RAPID, a jog) in between,
+  // and an old target would drive it back.
+  bool running = !motion_data_.groups.empty();
+  bool restarted = false;
+  for (const auto& group : motion_data_.groups)
+  {
+    const auto& channel = group.egm_channel_data;
+    const auto& status = channel.input.status();
+    // Robot-reported states only: channel activity (a read-count heuristic
+    // in the managers) flaps with link jitter and is not a new session.
+    running = running && status.egm_state() == abb::egm::wrapper::Status::EGM_RUNNING &&
+              status.rapid_execution_state() == abb::egm::wrapper::Status::RAPID_RUNNING &&
+              status.motor_state() == abb::egm::wrapper::Status::MOTORS_ON;
+    const uint32_t seqno = channel.input.header().sequence_number();
+    restarted = restarted || seqno < last_seqno_;
+    last_seqno_ = seqno;
+  }
+  if (!anyPositionClaimed() && have_states_)
+  {
+    if (!running)
+    {
+      // The robot is not servoing on EGM references now (EGM, RAPID or the
+      // motors stopped), so its reference may move (RAPID, a jog). Track it:
+      // abb_libegm keeps the last output for the first message of a resumed
+      // session, and that must be where the robot is, not an old target.
+      latchHold(nullptr);
+    }
+    else if (!session_running_ || restarted)
+    {
+      latchHold("EGM session (re)started");
+    }
+  }
+  session_running_ = running;
+}
+
+void ABBSystemHardware::drainEgm()
+{
+  // Each queued message is served by abb_libegm as soon as the previous one
+  // was answered, so a wake-up within 1 ms means "queued"; at the robot's
+  // own pace (>= 4 ms) the queue is empty.
+  for (int i = 0; i < 2000 && rclcpp::ok(); ++i)
+  {
+    latchHold(nullptr);
+    applyHold();
+    notePending();
+    egm_manager_->write(motion_data_);
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool got = egm_manager_->waitForMessage(20);
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    egm_manager_->read(motion_data_);
+    if (!got || waited >= 1ms)
+    {
+      if (i > 0)
+      {
+        RCLCPP_INFO(LOGGER, "Drained %d queued EGM message(s)", i);
+      }
+      return;
+    }
+  }
 }
 
 bool ABBSystemHardware::egmSessionOk(std::string& why) const
@@ -507,9 +756,32 @@ bool ABBSystemHardware::egmSessionOk(std::string& why) const
   return true;
 }
 
-return_type ABBSystemHardware::read(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/)
+return_type ABBSystemHardware::read(const rclcpp::Time& /*time*/, const rclcpp::Duration& period)
 {
-  egm_manager_->read(motion_data_);
+  if (egm_manager_->read(motion_data_))
+  {
+    have_states_ = true;
+  }
+  if (!motion_data_.groups.empty())
+  {
+    const uint32_t seqno = motion_data_.groups.front().egm_channel_data.input.header().sequence_number();
+    if (seqno != last_seen_seqno_ && pending_.size() == last_sent_.size())
+    {
+      last_sent_ = pending_;
+    }
+    last_seen_seqno_ = seqno;
+  }
+  trackSession();
+
+  // ros2_control calls read() but not write() while the hardware is
+  // inactive. Answer EGM here then, with the latched target: otherwise
+  // abb_libegm replies to every message with the last command it got (the
+  // robot drives to it when a session resumes) and blocks 24 ms per message
+  // (old messages queue up).
+  if (!active_)
+  {
+    answerEgmWithHold(period.seconds());
+  }
 
   // EGM session supervision. Upstream keeps the
   // hardware and its controllers active when EGM goes away: the channel
@@ -553,7 +825,9 @@ return_type ABBSystemHardware::write(const rclcpp::Time& /*time*/, const rclcpp:
                  egm_lost_reason_.c_str());
     return return_type::DEACTIVATE;
   }
+  applyHold();
   enforceCommandLimits(period.seconds());
+  notePending();
   egm_manager_->write(motion_data_);
   return return_type::OK;
 }

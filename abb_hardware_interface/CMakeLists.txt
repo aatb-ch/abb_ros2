@@ -81,14 +81,15 @@ if(BUILD_TESTING)
   # on localhost, see test/fake_egm_robot.hpp).
   find_package(ament_cmake_gtest REQUIRED)
   find_package(abb_libegm REQUIRED)
-  ament_add_gtest(test_abb_hardware_interface
-    test/test_abb_hardware_interface.cpp
-    TIMEOUT 300)
-  target_include_directories(test_abb_hardware_interface PRIVATE include test)
-  target_link_libraries(test_abb_hardware_interface
-    ${PROJECT_NAME} abb_libegm::abb_libegm)
-  ament_target_dependencies(test_abb_hardware_interface
-    ${THIS_PACKAGE_INCLUDE_DEPENDS})
+  foreach(test_name
+      test_abb_hardware_interface
+      test_idle_hold)
+    ament_add_gtest(${test_name} test/${test_name}.cpp TIMEOUT 300)
+    target_include_directories(${test_name} PRIVATE include test)
+    target_link_libraries(${test_name}
+      ${PROJECT_NAME} abb_libegm::abb_libegm)
+    ament_target_dependencies(${test_name} ${THIS_PACKAGE_INCLUDE_DEPENDS})
+  endforeach()
 endif()
 
 ament_export_include_directories(include)

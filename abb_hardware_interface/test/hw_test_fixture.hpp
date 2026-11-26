@@ -127,6 +127,21 @@ protected:
     return active_;
   }
 
+  // A controller claims (true) or releases (false) every joint's position +
+  // velocity command interfaces, as the controller manager does at a switch.
+  void claim(bool on)
+  {
+    std::vector<std::string> names;
+    for (int i = 1; i <= 6; ++i)
+    {
+      names.push_back("joint_" + std::to_string(i) + "/position");
+      names.push_back("joint_" + std::to_string(i) + "/velocity");
+    }
+    const std::vector<std::string> none;
+    ASSERT_EQ(hw_->prepare_command_mode_switch(on ? names : none, on ? none : names), return_type::OK);
+    ASSERT_EQ(hw_->perform_command_mode_switch(on ? names : none, on ? none : names), return_type::OK);
+  }
+
   double state(const std::string& joint, const std::string& iface = "position")
   {
     for (auto& s : state_ifs_)

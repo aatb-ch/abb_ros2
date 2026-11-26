@@ -80,6 +80,7 @@ TEST_F(HwTest, SoftLimitsClampPositionAndStep)
   robot_->start();
   init({}, 1.0);  // 1 rad/s
   ASSERT_TRUE(activate());
+  claim(true);
   robot_->clearReplies();
   run(400, [&] { command("joint_1", 10.0); });  // far beyond upper = 3.0 rad
   const auto r = robot_->replies();
@@ -99,6 +100,7 @@ TEST_F(HwTest, NonFiniteCommandHolds)
   robot_->start();
   init();
   ASSERT_TRUE(activate());
+  claim(true);
   robot_->clearReplies();
   EXPECT_EQ(run(100, [&] { command("joint_2", std::nan("")); }), 100);
   EXPECT_TRUE(active_);
