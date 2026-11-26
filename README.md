@@ -40,3 +40,17 @@ To run over all the files in the repo manually:
 To run pre-commit automatically before committing in a local repo, install git hooks:
 
     pre-commit install
+
+## Testing on ROS 2 Jazzy
+
+`scripts/test_jazzy.sh` builds `abb_hardware_interface` and `abb_rws_client` in a
+throwaway `ros:jazzy-ros-base` container against the pinned dependencies in
+`abb.repos` and runs their tests. The hardware-interface tests drive
+`ABBSystemHardware` the way ros2_control does against a fake robot controller
+that speaks EGM over UDP on localhost (`abb_hardware_interface/test/`), so no
+robot or RobotStudio is needed. On this fork every pull request is merged only
+with this script green.
+
+```bash
+scripts/test_jazzy.sh            # or: scripts/test_jazzy.sh <another Jazzy image>
+```

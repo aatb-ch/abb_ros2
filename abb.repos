@@ -1,17 +1,20 @@
+# Dependencies of abb_ros2, pinned to exact commits so every build (and CI)
+# uses the same ABB libraries. The ABB libraries themselves are used
+# unmodified.
 repositories:
   abb_libegm:
     type: git
     url: https://github.com/ros-industrial/abb_libegm.git
-    version: master
+    version: 2c9350abfb67131cae796805fed8cd6eeb2ab7f9   # master, 2023-02-22
   abb_librws:
     type: git
     url: https://github.com/ros-industrial/abb_librws.git
-    version: master
+    version: 9ba08371482f3975f364011db9b1368fa0fc6b32   # master, 2023-02-22
   abb_egm_rws_managers:
     type: git
     url: https://github.com/ros-industrial/abb_egm_rws_managers.git
-    version: master
+    version: 7e554e53b415df1bbd743392b84a055c499b63d2   # master, 2025-05-27
   abb_ros2_msgs:
     type: git
     url: https://github.com/gbartyzel/abb_ros2_msgs.git
-    version: rolling
+    version: 071bb1fc2148a7cd850a1ff550c5987e67da6bdd   # rolling
