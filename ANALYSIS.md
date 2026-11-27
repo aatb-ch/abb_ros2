@@ -165,7 +165,11 @@ bursts up to ~900 ms, 1.6 % loss, EGM inter-arrival bunching up to 213 ms.
   never run (O6). `polling_rate` is already a parameter
   (`abb_rws_client.launch.py:51`).
 - **Port.** Separate callback groups for the timer, the services and the
-  subscriptions. The RWSManager mutexes still serialise HTTP.
+  subscriptions, and one `RWSManager` each for the state publisher and the
+  service provider. A shared manager is not enough: the poll holds the
+  manager's interface mutex for the whole round trip and every service only
+  `try_lock`s it (`rws_manager.cpp:421-441`), so a service landing during a
+  poll fails at once with result code 1001 "Server is busy" (fixed in PR 8).
 
 ### 7. RWS sessions [MEDIUM]
 
@@ -222,6 +226,7 @@ bursts up to ~900 ms, 1.6 % loss, EGM inter-arrival bunching up to 213 ms.
 | C | per-sent-packet step limit (`egm_max_step_scale`, default off) | see PR |
 | D+E | `velocity_command_mode` (default unchanged), joint bounds never wider than the controller's | see PR |
 | F | rws_client callback groups, one RWS session pair, bounded RWS wait in the hardware | see PR |
+| F2 | rws_client: one RWSManager per role again (shared manager answered services "Server is busy" during polls) | see PR |
 
 ### Owner decisions pending
 - `egm_max_step_scale` (default off): enable it, at 1.0 (max velocity per EGM sample)?
@@ -245,4 +250,4 @@ bursts up to ~900 ms, 1.6 % loss, EGM inter-arrival bunching up to 213 ms.
 | F | 1/15001 | 26.928 | 0.0 | 4.431 (3.0x, 5/5083) | 14.76 (1809/5226) | 2 | 0.584 | 0 | 0 |
 | Fdef | 1/15004 | 28.648 | 0.0 | 2.401 (1.668x, 6/5107) | 14.27 (1914/5227) | 2 | 1.773 | 0 | 0 |
 
-RWS (rws_client at 5 Hz polling, 150 ms each way on the RWS port, `get_speed_ratio` x 3, two driver starts): stock answered 1 of 6 calls (8.1 s), 5 timed out after 20 s; F answered 6 of 6 in 0.5-0.6 s. RWS sessions over the two starts: stock 8, F 4 (both logged out on a clean shutdown).
+RWS (rws_client at 5 Hz polling, 150 ms each way on the RWS port, `get_speed_ratio` x 3, two driver starts): stock answered 1 of 6 calls (8.1 s), 5 timed out after 20 s; F answered 6 of 6 in 0.5-0.6 s. RWS sessions over the two starts: stock 8, F 4 (both logged out on a clean shutdown). F's shared manager answered services 1001 "Server is busy" whenever a call landed during a poll; F2 (PR 8) restores one manager per role: twice F's sessions per start, still logged out on shutdown.
