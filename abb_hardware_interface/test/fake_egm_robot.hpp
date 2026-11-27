@@ -98,6 +98,13 @@ public:
     egm_running_ = egm_running;
     rapid_running_ = rapid_running;
   }
+  // RAPID reported as UNDEFINED although it runs (an EGM bug after a
+  // controller restart; the robot still servos on EGM).
+  void setRapidUndefined(bool undefined)
+  {
+    std::lock_guard<std::mutex> l(m_);
+    rapid_undefined_ = undefined;
+  }
   // false = the robot stops sending (an inbound gap / lost link).
   void setSending(bool sending)
   {
@@ -298,8 +305,10 @@ private:
     msg.mutable_mcistate()->set_state(egm_running_ ? EgmMCIState_MCIStateType_MCI_RUNNING :
                                                      EgmMCIState_MCIStateType_MCI_STOPPED);
     msg.set_mciconvergencemet(true);
-    msg.mutable_rapidexecstate()->set_state(rapid_running_ ? EgmRapidCtrlExecState_RapidCtrlExecStateType_RAPID_RUNNING :
-                                                             EgmRapidCtrlExecState_RapidCtrlExecStateType_RAPID_STOPPED);
+    msg.mutable_rapidexecstate()->set_state(
+        rapid_undefined_ ? EgmRapidCtrlExecState_RapidCtrlExecStateType_RAPID_UNDEFINED :
+        rapid_running_   ? EgmRapidCtrlExecState_RapidCtrlExecStateType_RAPID_RUNNING :
+                           EgmRapidCtrlExecState_RapidCtrlExecStateType_RAPID_STOPPED);
     msg.set_utilizationrate(utilization_);
     return msg;
   }
@@ -323,7 +332,7 @@ private:
     }
     std::lock_guard<std::mutex> l(m_);
     r.robot_seqno = last_seqno_;
-    const bool moving = s.planned().joints().joints_size() >= 6 && motors_on_ && egm_running_ && rapid_running_;
+    const bool moving = s.planned().joints().joints_size() >= 6 && motors_on_ && egm_running_ && (rapid_running_ || rapid_undefined_);
     if (moving)
     {
       reference_ = r.position;  // the robot's reference follows the EGM command
@@ -358,6 +367,7 @@ private:
   bool motors_on_{ true };
   bool egm_running_{ true };
   bool rapid_running_{ true };
+  bool rapid_undefined_{ false };
   bool follow_{ false };
   double max_speed_dps_{ 1e9 };
   double utilization_{ 50.0 };

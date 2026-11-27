@@ -49,9 +49,11 @@ using RAPIDSymbols = abb::rws::RWSStateMachineInterface::ResourceIdentifiers::RA
 
 namespace abb_rws_client
 {
-RWSServiceProviderROS::RWSServiceProviderROS(const rclcpp::Node::SharedPtr& node,
-                                             std::shared_ptr<abb::robot::RWSManager> rws_manager)
-  : node_(node), rws_manager_(std::move(rws_manager))
+RWSServiceProviderROS::RWSServiceProviderROS(const rclcpp::Node::SharedPtr& node, const std::string& robot_ip,
+                                             unsigned short robot_port)
+  : node_(node)
+  , rws_manager_{ robot_ip, robot_port, abb::rws::SystemConstants::General::DEFAULT_USERNAME,
+                  abb::rws::SystemConstants::General::DEFAULT_PASSWORD }
 {
   service_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   rclcpp::SubscriptionOptions sub_options;
@@ -60,7 +62,7 @@ RWSServiceProviderROS::RWSServiceProviderROS(const rclcpp::Node::SharedPtr& node
   std::string robot_id = node_->get_parameter("robot_nickname").as_string();
   bool no_connection_timeout = node_->get_parameter("no_connection_timeout").as_bool();
   robot_controller_description_ =
-      abb::robot::utilities::establishRWSConnection(*rws_manager_, robot_id, no_connection_timeout);
+      abb::robot::utilities::establishRWSConnection(rws_manager_, robot_id, no_connection_timeout);
   abb::robot::utilities::verifyRobotWareVersion(robot_controller_description_.header().robot_ware_version());
 
   system_state_sub_ = node_->create_subscription<abb_robot_msgs::msg::SystemState>(
@@ -271,7 +273,7 @@ bool RWSServiceProviderROS::getFileContents(const abb_robot_msgs::srv::GetFileCo
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.getFile(abb::rws::RWSClient::FileResource(req->filename), &res->contents))
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -299,7 +301,7 @@ bool RWSServiceProviderROS::getIOSignal(const abb_robot_msgs::srv::GetIOSignal::
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     res->value = interface.getIOSignal(req->signal);
 
     if (!res->value.empty())
@@ -329,7 +331,7 @@ bool RWSServiceProviderROS::getRAPIDBool(const abb_robot_msgs::srv::GetRAPIDBool
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RAPIDBool rapid_bool;
     if (interface.getRAPIDSymbolData(req->path.task, req->path.module, req->path.symbol, &rapid_bool))
     {
@@ -359,7 +361,7 @@ bool RWSServiceProviderROS::getRAPIDDNum(const abb_robot_msgs::srv::GetRAPIDDnum
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RAPIDDnum rapid_dnum;
     if (interface.getRAPIDSymbolData(req->path.task, req->path.module, req->path.symbol, &rapid_dnum))
     {
@@ -389,7 +391,7 @@ bool RWSServiceProviderROS::getRAPIDNum(const abb_robot_msgs::srv::GetRAPIDNum::
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RAPIDNum rapid_num{};
     if (interface.getRAPIDSymbolData(req->path.task, req->path.module, req->path.symbol, &rapid_num))
     {
@@ -419,7 +421,7 @@ bool RWSServiceProviderROS::getRAPIDString(const abb_robot_msgs::srv::GetRAPIDSt
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RAPIDString rapid_string{};
     if (interface.getRAPIDSymbolData(req->path.task, req->path.module, req->path.symbol, &rapid_string))
     {
@@ -449,7 +451,7 @@ bool RWSServiceProviderROS::getRAPIDSymbol(const abb_robot_msgs::srv::GetRAPIDSy
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     res->value = interface.getRAPIDSymbolData(req->path.task, req->path.module, req->path.symbol);
 
     if (!res->value.empty())
@@ -475,7 +477,7 @@ bool RWSServiceProviderROS::getSpeedRatio(const abb_robot_msgs::srv::GetSpeedRat
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     try
     {
       res->speed_ratio = interface.getSpeedRatio();
@@ -508,7 +510,7 @@ bool RWSServiceProviderROS::ppToMain(const abb_robot_msgs::srv::TriggerWithResul
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.resetRAPIDProgramPointer())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -535,7 +537,7 @@ bool RWSServiceProviderROS::setFileContents(const abb_robot_msgs::srv::SetFileCo
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.uploadFile(abb::rws::RWSClient::FileResource(req->filename), req->contents))
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -563,7 +565,7 @@ bool RWSServiceProviderROS::setIOSignal(const abb_robot_msgs::srv::SetIOSignal::
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.setIOSignal(req->signal, req->value))
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -587,7 +589,7 @@ bool RWSServiceProviderROS::setMotorsOff(const abb_robot_msgs::srv::TriggerWithR
     return true;
   }
 
-  rws_manager_->runPriorityService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runPriorityService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.setMotorsOff())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -618,7 +620,7 @@ bool RWSServiceProviderROS::setMotorsOn(const abb_robot_msgs::srv::TriggerWithRe
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.setMotorsOn())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -649,7 +651,7 @@ bool RWSServiceProviderROS::setRAPIDBool(const abb_robot_msgs::srv::SetRAPIDBool
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RAPIDBool rapid_bool = static_cast<bool>(req->value);
     if (interface.setRAPIDSymbolData(req->path.task, req->path.module, req->path.symbol, rapid_bool))
     {
@@ -682,7 +684,7 @@ bool RWSServiceProviderROS::setRAPIDDNum(const abb_robot_msgs::srv::SetRAPIDDnum
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RAPIDDnum rapid_dnum = req->value;
     if (interface.setRAPIDSymbolData(req->path.task, req->path.module, req->path.symbol, rapid_dnum))
     {
@@ -715,7 +717,7 @@ bool RWSServiceProviderROS::setRAPIDNum(const abb_robot_msgs::srv::SetRAPIDNum::
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RAPIDNum rapid_num = req->value;
     if (interface.setRAPIDSymbolData(req->path.task, req->path.module, req->path.symbol, rapid_num))
     {
@@ -748,7 +750,7 @@ bool RWSServiceProviderROS::setRAPIDString(const abb_robot_msgs::srv::SetRAPIDSt
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RAPIDString rapid_string = req->value;
     if (interface.setRAPIDSymbolData(req->path.task, req->path.module, req->path.symbol, rapid_string))
     {
@@ -781,7 +783,7 @@ bool RWSServiceProviderROS::setRAPIDSymbol(const abb_robot_msgs::srv::SetRAPIDSy
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.setRAPIDSymbolData(req->path.task, req->path.module, req->path.symbol, req->value))
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -809,7 +811,7 @@ bool RWSServiceProviderROS::setSpeedRatio(const abb_robot_msgs::srv::SetSpeedRat
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     try
     {
       if (interface.setSpeedRatio(req->speed_ratio))
@@ -848,7 +850,7 @@ bool RWSServiceProviderROS::startRAPID(const abb_robot_msgs::srv::TriggerWithRes
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.startRAPIDExecution())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -871,7 +873,7 @@ bool RWSServiceProviderROS::stopRAPID(const abb_robot_msgs::srv::TriggerWithResu
     return true;
   }
 
-  rws_manager_->runPriorityService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runPriorityService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.stopRAPIDExecution())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -910,7 +912,7 @@ bool RWSServiceProviderROS::getEGMSettings(const abb_rapid_sm_addin_msgs::srv::G
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RWSStateMachineInterface::EGMSettings settings;
 
     if (interface.services().egm().getSettings(req->task, &settings))
@@ -957,7 +959,7 @@ bool RWSServiceProviderROS::setEGMSettings(const abb_rapid_sm_addin_msgs::srv::S
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RWSStateMachineInterface::EGMSettings settings = abb::robot::utilities::map(req->settings);
 
     if (interface.services().egm().setSettings(req->task, settings))
@@ -995,7 +997,7 @@ bool RWSServiceProviderROS::runRAPIDRoutine(const abb_robot_msgs::srv::TriggerWi
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.services().rapid().signalRunRAPIDRoutine())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -1031,7 +1033,7 @@ bool RWSServiceProviderROS::runSGRoutine(const abb_robot_msgs::srv::TriggerWithR
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.services().sg().signalRunSGRoutine())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -1075,7 +1077,7 @@ bool RWSServiceProviderROS::setRAPIDRoutine(const abb_rapid_sm_addin_msgs::srv::
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.services().rapid().setRoutineName(req->task, req->routine))
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -1131,7 +1133,7 @@ bool RWSServiceProviderROS::setSGCommand(const abb_rapid_sm_addin_msgs::srv::Set
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     abb::rws::RAPIDNum sg_command_input = static_cast<float>(req_command);
     abb::rws::RAPIDNum sg_target_position_input = req->target_position;
 
@@ -1171,7 +1173,7 @@ bool RWSServiceProviderROS::startEGMJoint(const abb_robot_msgs::srv::TriggerWith
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.services().egm().signalEGMStartJoint())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -1207,7 +1209,7 @@ bool RWSServiceProviderROS::startEGMPose(const abb_robot_msgs::srv::TriggerWithR
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.services().egm().signalEGMStartPose())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -1243,7 +1245,7 @@ bool RWSServiceProviderROS::startEGMStream(const abb_robot_msgs::srv::TriggerWit
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.services().egm().signalEGMStartStream())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -1275,7 +1277,7 @@ bool RWSServiceProviderROS::stopEGM(const abb_robot_msgs::srv::TriggerWithResult
     return true;
   }
 
-  rws_manager_->runPriorityService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runPriorityService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.services().egm().signalEGMStop())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -1307,7 +1309,7 @@ bool RWSServiceProviderROS::stopEGMStream(const abb_robot_msgs::srv::TriggerWith
     return true;
   }
 
-  rws_manager_->runService([&](abb::rws::RWSStateMachineInterface& interface) {
+  rws_manager_.runService([&](abb::rws::RWSStateMachineInterface& interface) {
     if (interface.services().egm().signalEGMStopStream())
     {
       res->result_code = abb_robot_msgs::msg::ServiceResponses::RC_SUCCESS;
@@ -1503,7 +1505,7 @@ bool RWSServiceProviderROS::verifyRAPIDStopped(uint16_t& result_code, std::strin
 
 bool RWSServiceProviderROS::verifyRWSManagerReady(uint16_t& result_code, std::string& message)
 {
-  if (!rws_manager_->isInterfaceReady())
+  if (!rws_manager_.isInterfaceReady())
   {
     message = abb_robot_msgs::msg::ServiceResponses::SERVER_IS_BUSY;
     result_code = abb_robot_msgs::msg::ServiceResponses::RC_SERVER_IS_BUSY;

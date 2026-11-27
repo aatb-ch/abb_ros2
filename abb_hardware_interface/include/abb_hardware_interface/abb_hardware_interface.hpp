@@ -19,10 +19,12 @@
 #include <abb_egm_rws_managers/rws_manager.h>
 #include <abb_hardware_interface/visibility_control.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -125,32 +127,42 @@ private:
   std::chrono::steady_clock::time_point last_limit_log_{};
 
   // Idle hold: while no controller claims a joint's position command
-  // interface, the robot gets a constant target with velocity 0 - the last
-  // command (after a controller release / deactivation), re-latched ONCE
-  // from the robot's own reference at activation and at every EGM session
-  // (re)start. Never re-sampled while the robot servos on it. While the
-  // hardware is inactive, read() answers EGM with it.
+  // interface, the robot gets a constant target with velocity 0 - the
+  // measured position, latched ONCE at activation, at every EGM session
+  // (re)start, at a controller release and at deactivation. Never re-sampled
+  // while the robot servos on it. While the hardware is inactive, read()
+  // answers EGM with it.
   void latchHold(const char* why);
-  void holdLastCommand();
   void applyHold();
   void answerEgmWithHold(double period_s);
   void trackSession();
   void drainEgm();
-  bool anyPositionClaimed() const;
   std::vector<std::string> joint_names_;   // exported names, motion_data_ order
   std::vector<double> hold_position_;      // latched target [rad or m]
   bool hold_valid_{ false };
-  std::vector<bool> claimed_position_;
-  std::vector<bool> claimed_velocity_;
   bool active_{ false };
   bool have_states_{ false };
   bool session_running_{ false };
 
-  // What the robot actually got: the robot sends its next message only after
-  // our reply to the previous one, so when a new sequence number arrives,
-  // the last position written (pending_) went out (last_sent_). During an
-  // inbound gap a controller keeps writing, but none of it is sent.
-  void notePending();
+  // Shared with the non-realtime switch thread (prepare/perform_command_mode_switch),
+  // nothing else is: the claimed command interfaces (bit k = joint k) and
+  // whether a controller may start now (published by read()).
+  void syncClaims();   // realtime: take over the claims, latch on a release
+  void publishSession(bool ok, const std::string& why);
+  std::atomic<uint64_t> claimed_position_{ 0 };
+  std::atomic<uint64_t> claimed_velocity_{ 0 };
+  uint64_t rt_position_claims_{ 0 };   // the realtime thread's copy
+  uint64_t rt_velocity_claims_{ 0 };
+  std::atomic<bool> session_ok_{ false };
+  std::mutex session_why_mutex_;
+  std::string session_why_;    // under session_why_mutex_
+  std::string published_why_;  // realtime copy (lock only on a change)
+
+  // Per-sent-packet step limit only (egm_max_step_scale > 0): what the robot
+  // actually got. The robot sends its next message only after our reply to
+  // the previous one, so when a new sequence number arrives, the last
+  // position written (pending_) went out (last_sent_). During an inbound gap
+  // a controller keeps writing, but none of it is sent.
   std::vector<double> last_sent_;
   std::vector<double> pending_;
 

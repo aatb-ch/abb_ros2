@@ -53,16 +53,18 @@ constexpr double THROTTLE_TIME{ 10.0 };
 
 namespace abb_rws_client
 {
-RWSStatePublisherROS::RWSStatePublisherROS(const rclcpp::Node::SharedPtr& node,
-                                           std::shared_ptr<abb::robot::RWSManager> rws_manager)
-  : node_(node), rws_manager_(std::move(rws_manager))
+RWSStatePublisherROS::RWSStatePublisherROS(const rclcpp::Node::SharedPtr& node, const std::string& robot_ip,
+                                           unsigned short robot_port)
+  : node_(node)
+  , rws_manager_{ robot_ip, robot_port, abb::rws::SystemConstants::General::DEFAULT_USERNAME,
+                  abb::rws::SystemConstants::General::DEFAULT_PASSWORD }
 {
   node_->declare_parameter("polling_rate", 5.0);
 
   std::string robot_id = node_->get_parameter("robot_nickname").as_string();
   bool no_connection_timeout = node_->get_parameter("no_connection_timeout").as_bool();
   robot_controller_description_ =
-      abb::robot::utilities::establishRWSConnection(*rws_manager_, robot_id, no_connection_timeout);
+      abb::robot::utilities::establishRWSConnection(rws_manager_, robot_id, no_connection_timeout);
   abb::robot::utilities::verifyRobotWareVersion(robot_controller_description_.header().robot_ware_version());
 
   abb::robot::initializeMotionData(motion_data_, robot_controller_description_);
@@ -90,7 +92,7 @@ void RWSStatePublisherROS::timer_callback()
 {
   try
   {
-    rws_manager_->collectAndUpdateRuntimeData(system_state_data_, motion_data_);
+    rws_manager_.collectAndUpdateRuntimeData(system_state_data_, motion_data_);
   }
   catch (const std::runtime_error& exception)
   {

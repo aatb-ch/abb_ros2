@@ -17,20 +17,8 @@ int main(int argc, char** argv)
   client_node->get_parameter<std::string>("robot_ip", robot_ip);
   client_node->get_parameter<int>("robot_port", robot_port);
 
-  // One RWS manager per role. The state publisher's poll holds the manager's
-  // interface mutex for the whole RWS round trip, and every service only
-  // try_locks it (RWSManager::verifyRWSManagerReady), so a shared manager makes
-  // any service call that lands during a poll fail at once with "Server is
-  // busy" (stop_egm included). Separate managers keep polling and services
-  // independent; librws logs each manager's sessions out when it is destroyed,
-  // i.e. on a clean shutdown (SIGINT/SIGTERM end spin()).
-  auto make_manager = [&]() {
-    return std::make_shared<abb::robot::RWSManager>(
-        robot_ip, static_cast<unsigned short>(robot_port), abb::rws::SystemConstants::General::DEFAULT_USERNAME,
-        abb::rws::SystemConstants::General::DEFAULT_PASSWORD);
-  };
-  abb_rws_client::RWSServiceProviderROS srv_provider(client_node, make_manager());
-  abb_rws_client::RWSStatePublisherROS state_publisher(client_node, make_manager());
+  abb_rws_client::RWSServiceProviderROS srv_provider(client_node, robot_ip, robot_port);
+  abb_rws_client::RWSStatePublisherROS state_publisher(client_node, robot_ip, robot_port);
 
   rclcpp::executors::MultiThreadedExecutor exec;
   exec.add_node(client_node);

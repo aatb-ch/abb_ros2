@@ -227,11 +227,12 @@ bursts up to ~900 ms, 1.6 % loss, EGM inter-arrival bunching up to 213 ms.
 | D+E | `velocity_command_mode` (default unchanged), joint bounds never wider than the controller's | see PR |
 | F | rws_client callback groups, one RWS session pair, bounded RWS wait in the hardware | see PR |
 | F2 | rws_client: one RWSManager per role again (shared manager answered services "Server is busy" during polls) | see PR |
+| G | simplification toward ROS 1 / stock: one hold (measured position, latched once per event: activation, session (re)start, controller release, deactivation; the "planned" and last-sent hold sources removed); switch callbacks share only atomics with read()/write(); RAPID UNDEFINED counts as running (libegm `statesOk()`); stock `rws_client` constructors; stock `establishRWSConnection` (5 attempts) in `on_init` | see PR |
 
 ### Owner decisions pending
 - `egm_max_step_scale` (default off): enable it, at 1.0 (max velocity per EGM sample)?
 - `velocity_command_mode` (default `feedforward`): position_only / scaled, after a tuning matrix on the robot (no oscillation on step trajectories).
-- `egm_loss_grace_ms` (default 50 ms): a Wi-Fi link needed 500 ms; a longer grace only delays the stop on silence.
+- `egm_loss_grace_ms` (default 50 ms): a Wi-Fi link needed 500 ms; a longer grace only delays the stop on silence. ROS 1's effective threshold was about 250 ms (5 reads without a new message x 50 ms wait).
 
 ### Known limits (not fixed here)
 - **Lost replies.** If the link drops replies while robot messages still arrive (e.g. at the start of a blackout), the robot can see more than one step at once. The step limit is relative to what the driver sent; the robot's own EGM speed supervision (`\MaxSpeedDeviation`) is the complement.

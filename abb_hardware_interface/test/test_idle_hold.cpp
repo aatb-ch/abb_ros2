@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Idle hold: with no controller claiming the command interfaces the robot is
-// sent one target, latched once from its own reference; never a stale
+// sent one target, latched once from the measured position; never a stale
 // command, never a re-sampled (drifting) one, never a queued old state.
 
 #include "hw_test_fixture.hpp"
@@ -25,11 +25,35 @@ namespace
 {
 const Joints START{ 10.0, 20.0, -30.0, 40.0, 30.0, -60.0 };  // deg
 const Joints SAG{ 0.0, -0.4, 0.3, 0.0, -0.2, 0.0 };          // measured - reference
+
+Joints plus(const Joints& a, const Joints& b)
+{
+  Joints r;
+  for (int i = 0; i < 6; ++i)
+  {
+    r[i] = a[i] + b[i];
+  }
+  return r;
 }
 
-// Idle: the target is the robot's reference (not the sagging, noisy
-// measurement) and stays bit-identical - no creep, however long.
-TEST_F(HwTest, IdleHoldIsTheReferenceAndBitIdentical)
+// Every reply equals the first one, bit for bit, with no speed reference.
+void expectConstantHold(const std::vector<EgmReply>& r)
+{
+  ASSERT_FALSE(r.empty());
+  for (const auto& x : r)
+  {
+    for (int i = 0; i < 6; ++i)
+    {
+      ASSERT_EQ(x.position[i], r.front().position[i]) << "hold target changed while idle";
+      ASSERT_EQ(x.speed[i], 0.0);
+    }
+  }
+}
+}  // namespace
+
+// Idle: the target is the measured position, sampled once, and stays
+// bit-identical however noisy the measurement - no creep, no sag follow.
+TEST_F(HwTest, IdleHoldIsLatchedOnceAndBitIdentical)
 {
   startRobot(START);
   robot_->setSag(SAG);
@@ -41,53 +65,60 @@ TEST_F(HwTest, IdleHoldIsTheReferenceAndBitIdentical)
   run(2500);  // 5 s idle
   const auto r = robot_->replies();
   ASSERT_GT(r.size(), 1000u);
-  for (const auto& x : r)
-  {
-    for (int i = 0; i < 6; ++i)
-    {
-      ASSERT_EQ(x.position[i], r.front().position[i]) << "hold target changed while idle";
-      ASSERT_EQ(x.speed[i], 0.0);
-    }
-  }
-  EXPECT_LT(maxDeviation(r, START), 1e-6) << "hold is not the robot's reference";
+  expectConstantHold(r);
+  EXPECT_LT(maxDeviation(r, plus(START, SAG)), 0.05 + 1e-6) << "hold is not the measured position";
 }
 
-// A controller moves the arm, then releases the interfaces mid-motion: the
-// robot keeps the last position command (no re-sampling, no step) and gets
-// no speed reference any more; a stray write while unclaimed is ignored.
-TEST_F(HwTest, ControllerReleaseKeepsPositionDropsVelocity)
+// A controller drives joint_1 faster than the arm follows, then is stopped
+// mid-move (the JTC keeps its last position command, velocity 0): the robot
+// holds where it is when released - once, velocity 0, bit-identical for 2 s
+// of idle - never the controller's last command, which is far ahead. A stray
+// write while unclaimed is ignored.
+TEST_F(HwTest, MidMoveReleaseHoldsWhereTheRobotIs)
 {
   startRobot(START);
-  robot_->setFollow(true);
+  robot_->setFollow(true, 20.0);  // the arm follows at most 20 deg/s
   robot_->start();
   init();
   ASSERT_TRUE(activate());
   claim(true);
   double q = START[0] * DEG;
   run(500, [&] {
-    q += 0.5 * 0.002;  // 0.5 rad/s on joint_1
+    q += 0.5 * 0.002;  // 0.5 rad/s (28.6 deg/s) on joint_1
     command("joint_1", q);
     command("joint_1", 0.5, "velocity");
   });
   ASSERT_GT(robot_->replies().back().speed[0], 1.0);
-  claim(false);
-  run(2);  // the reply already queued in abb_libegm goes out first
-  robot_->clearReplies();
-  run(500, [&] { command("joint_1", q + 1.0); });  // a stray write, unclaimed
-  const auto r = robot_->replies();
-  ASSERT_GT(r.size(), 100u);
-  EXPECT_EQ(maxStep(r), 0.0);
-  EXPECT_NEAR(r.front().position[0], q / DEG, 0.005 / DEG);  // the last one sent (a few cycles back)
-  for (const auto& x : r)
+  const double at_release = robot_->position()[0];
+  ASSERT_GT(q / DEG - at_release, 3.0) << "the command should run ahead of the arm";
+  claim(false);  // the JTC's on_deactivate keeps q, sets velocity 0
+  // The target goes back from the last command to the latched position at
+  // no more than max_velocity (the soft limits' step bound), so the arm runs
+  // on a little and returns.
+  double furthest = at_release;
+  for (int k = 0; k < 250; ++k)
   {
-    EXPECT_EQ(x.speed[0], 0.0);
+    run(1);
+    furthest = std::max(furthest, robot_->position()[0]);
   }
+  RecordProperty("run_on_deg", std::to_string(furthest - at_release));
+  // Here the command leads the arm by ~8.6 deg; holding the last command
+  // (the previous behaviour) ran on all of it.
+  EXPECT_LT(furthest - at_release, 3.0) << "the arm ran on towards the old command";
+  robot_->clearReplies();
+  run(1000, [&] { command("joint_1", q + 1.0); });  // 2 s idle; a stray write, unclaimed
+  const auto r = robot_->replies();
+  ASSERT_GT(r.size(), 400u);
+  expectConstantHold(r);
+  // Within the few cycles between the sample and the latch (20 deg/s).
+  EXPECT_NEAR(r.front().position[0], at_release, 0.2);
+  EXPECT_NEAR(robot_->position()[0], at_release, 0.2) << "the arm did not come to rest where it was released";
 }
 
 // A link gap, then the hardware deactivates on silence while the controller
-// had kept advancing: when the link is back, the robot must get the last
-// command it actually got, never the catch-up that was written but not sent.
-TEST_F(HwTest, DeactivationAfterGapHoldsWhatWasSent)
+// had kept advancing: when the link is back, the robot must hold where it
+// was, never the catch-up that was written but not sent.
+TEST_F(HwTest, DeactivationAfterGapHoldsWhereTheRobotIs)
 {
   startRobot(START);
   robot_->setFollow(true);
@@ -101,7 +132,7 @@ TEST_F(HwTest, DeactivationAfterGapHoldsWhatWasSent)
     command("joint_1", q);
   };
   run(250, controller);
-  const double before_gap = robot_->replies().back().position[0];
+  const double before_gap = robot_->position()[0];
   robot_->setSending(false);
   run(250, controller);  // 0.5 s gap: the controller runs ahead by ~14 deg
   ASSERT_FALSE(active_);
@@ -117,8 +148,40 @@ TEST_F(HwTest, DeactivationAfterGapHoldsWhatWasSent)
   // per-packet step limit bounds it to one step). Everything after: the hold.
   EXPECT_NEAR(r.front().position[0], before_gap, 0.5);
   std::vector<EgmReply> rest(r.begin() + 1, r.end());
-  EXPECT_EQ(maxStep(rest), 0.0);
-  EXPECT_NEAR(rest.front().position[0], before_gap, 0.06) << "the robot got a command that was never sent before";
+  expectConstantHold(rest);
+  EXPECT_NEAR(rest.front().position[0], before_gap, 0.15) << "the robot got a command that was never sent before";
+}
+
+// A new EGM session (sequence number restart) while a controller claims the
+// interfaces, the arm moved in between: the hardware deactivates and holds
+// the new session's position, never the old session's last command.
+TEST_F(HwTest, RestartWhileClaimedHoldsTheNewSessionPosition)
+{
+  startRobot(START);
+  robot_->setFollow(true);
+  robot_->start();
+  init();
+  ASSERT_TRUE(activate());
+  claim(true);
+  double q = START[0] * DEG;
+  auto controller = [&] {
+    q += 0.5 * 0.002;
+    command("joint_1", q);
+  };
+  run(250, controller);
+  robot_->setFollow(false);
+  const Joints moved{ -5.0, 10.0, -20.0, 30.0, 45.0, -50.0 };
+  robot_->setPosition(moved);  // e.g. RAPID moved the arm between sessions
+  robot_->newSession();
+  run(100, controller);
+  ASSERT_FALSE(active_);
+  run(10);  // inactive: read() answers EGM
+  robot_->clearReplies();
+  run(500);
+  const auto r = robot_->replies();
+  ASSERT_GT(r.size(), 100u);
+  expectConstantHold(r);
+  EXPECT_LT(maxDeviation(r, moved), 1e-6) << "held the old session's command";
 }
 
 // The resume snap: a controller drove the arm, the session stopped (RAPID
