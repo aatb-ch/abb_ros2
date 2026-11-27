@@ -61,10 +61,10 @@ public:
    * \brief Creates a state publisher.
    *
    * \param node ROS 2 node.
-   * \param rws_manager RWS manager, shared with the service provider (one
-   *        RWS session pair per node; polling uses its low-priority interface).
+   * \param robot_ip IP address for the robot controller's RWS server.
+   * \param robot_poty Port number for the robot controller's RWS server.
    */
-  RWSStatePublisherROS(const rclcpp::Node::SharedPtr& node, std::shared_ptr<abb::robot::RWSManager> rws_manager);
+  RWSStatePublisherROS(const rclcpp::Node::SharedPtr& node, const std::string& robot_ip, unsigned short robot_port);
 
 private:
   /**
@@ -84,7 +84,7 @@ private:
   /**
    * \brief Manager for handling RWS communication with the robot controller.
    */
-  std::shared_ptr<abb::robot::RWSManager> rws_manager_;
+  abb::robot::RWSManager rws_manager_;
 
   /**
    * \brief Description of the connected robot controller.

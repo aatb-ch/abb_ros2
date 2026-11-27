@@ -87,7 +87,7 @@ public:
    * \param robot_ip IP address for the robot controller's RWS server.
    * \param robot_poty Port number for the robot controller's RWS server.
    */
-  RWSServiceProviderROS(const rclcpp::Node::SharedPtr& node, std::shared_ptr<abb::robot::RWSManager> rws_manager);
+  RWSServiceProviderROS(const rclcpp::Node::SharedPtr& node, const std::string& robot_ip, unsigned short robot_port);
 
   RWSServiceProviderROS() = delete;
 
@@ -644,7 +644,7 @@ private:
   /**
    * \brief Manager for handling RWS communication with the robot controller.
    */
-  std::shared_ptr<abb::robot::RWSManager> rws_manager_;
+  abb::robot::RWSManager rws_manager_;
 
   /**
    * \brief Callback group of the services and the state subscriptions (the

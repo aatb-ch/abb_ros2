@@ -18,6 +18,8 @@
 
 #include "hw_test_fixture.hpp"
 
+#include <atomic>
+
 using namespace abb_test;
 using namespace std::chrono_literals;
 
@@ -133,4 +135,58 @@ TEST_F(Supervision, ActivationRefusedUnlessRunning)
   EXPECT_FALSE(activate());
   robot_->setStates(true, true, true);
   EXPECT_TRUE(activate());
+}
+
+// RAPID reported as UNDEFINED while it runs (EGM bug after a controller
+// restart): accepted as running, as abb_libegm does.
+TEST_F(Supervision, RapidUndefinedCountsAsRunning)
+{
+  startRobot(START);
+  robot_->setRapidUndefined(true);
+  robot_->start();
+  init();
+  ASSERT_TRUE(activate());
+  claim(true);
+  run(250);
+  EXPECT_TRUE(active_);
+}
+
+// The controller manager switches controllers on its non-realtime thread
+// while read()/write() keep running (ros2_control's non-asap switch). Run
+// both at once; with -fsanitize=thread this must report no data race.
+TEST_F(Supervision, SwitchWhileRunning)
+{
+  up();
+  claim(false);
+  std::atomic<bool> stop{ false };
+  std::vector<std::string> names;
+  for (int i = 1; i <= 6; ++i)
+  {
+    names.push_back("joint_" + std::to_string(i) + "/position");
+    names.push_back("joint_" + std::to_string(i) + "/velocity");
+  }
+  std::thread switcher([&] {
+    const std::vector<std::string> none;
+    bool on = false;
+    while (!stop)
+    {
+      on = !on;
+      if (hw_->prepare_command_mode_switch(on ? names : none, on ? none : names) == return_type::OK)
+      {
+        hw_->perform_command_mode_switch(on ? names : none, on ? none : names);
+      }
+      std::this_thread::sleep_for(3ms);
+    }
+  });
+  run(1000);
+  stop = true;
+  switcher.join();
+  EXPECT_TRUE(active_);
+  claim(false);
+  run(10);
+  robot_->clearReplies();
+  run(250);
+  const auto r = robot_->replies();
+  ASSERT_GT(r.size(), 50u);
+  EXPECT_EQ(maxStep(r), 0.0);
 }
